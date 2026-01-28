@@ -7,7 +7,6 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/gen2brain/malgo"
 	"github.com/hraban/opus"
@@ -67,28 +66,29 @@ func releasePacket(p *[]byte) {
 	}
 }
 
-// Lock-Free Jitter Buffer
+// Safe Jitter Buffer (Mutex-based)
 
 // JitterBuffer manages incoming audio packets for a single peer stream.
-// It is designed for high-concurrency access (Network Push vs Audio Pop)
-// using lock-free atomic operations for the critical data path.
+// It uses a standard sync.Mutex to protect the critical path, avoiding
+// dangerous unsafe.Pointer swaps. At 50 packets/sec, mutex contention is negligible.
 type JitterBuffer struct {
-	// slots is the storage backing. It is a direct map of SequenceID -> Data Pointer.
-	// We use unsafe.Pointer to allow atomic Swap operations on the slice data.
-	// stored type: *[]byte
-	slots [MaxSeq]unsafe.Pointer
+	mu sync.Mutex
 
-	// count tracks the number of filled slots atomically.
-	count int32
+	// slots is the storage backing. It is a direct map of SequenceID -> Data Pointer.
+	// stored type: *[]byte
+	slots [MaxSeq]*[]byte
+
+	// count tracks the number of filled slots.
+	count int
 
 	// latestSeq stores the highest SequenceID seen so far.
 	// Used to calculate the "horizon" for rejecting old packets.
-	latestSeq uint32
+	latestSeq uint16
 
 	// closed prevents new pushes during cleanup to avoid leaks.
-	closed int32
+	closed bool
 
-	// Consumer state (Thread-local to the Audio Callback)
+	// Consumer state (Thread-local to the Audio Callback, protected by mu)
 	lastPopped  uint16
 	buffering   bool // True if we are filling the buffer (silence output)
 	targetDepth int
@@ -105,15 +105,17 @@ func NewJitterBuffer(targetDepth int) *JitterBuffer {
 		buffering:   true,
 		targetDepth: targetDepth,
 		lastPopped:  65535, // Initialize to -1 (uint16 wrap)
-		latestSeq:   65535,
+		latestSeq:   65535, // Initialize to -1
 		decoder:     dec,
 	}
 }
 
 // Level returns the approximate number of packets currently in the buffer.
-// It is safe for concurrent calls and provides an atomic snapshot of the fill level.
+// It is safe for concurrent calls.
 func (jb *JitterBuffer) Level() int {
-	return int(atomic.LoadInt32(&jb.count))
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	return jb.count
 }
 
 // Push inserts a packet into the buffer based on its Sequence ID.
@@ -124,18 +126,20 @@ func (jb *JitterBuffer) Level() int {
 // is rejected (old/duplicate) or overwritten, Push handles freeing it back to the pool.
 // This method is safe to call from multiple network routines concurrently.
 func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+
 	// Check if buffer is closed (Cleanup in progress)
-	if atomic.LoadInt32(&jb.closed) == 1 {
+	if jb.closed {
 		releasePacket(data)
 		return
 	}
 
 	// Horizon Check: Is the packet too old?
-	latest := uint16(atomic.LoadUint32(&jb.latestSeq))
-
 	// Circular difference:
 	// If diff < 0, seq is "behind" latest.
 	// If diff > 0, seq is "ahead" (new latest).
+	latest := jb.latestSeq
 	diff := int16(seq - latest)
 
 	// If the packet is extremely old (behind by more than MaxDropout), drop it.
@@ -145,50 +149,21 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 		return
 	}
 
-	// Atomic Insertion (Zero-Copy)
-	ptr := unsafe.Pointer(data)
+	// Store logic
+	old := jb.slots[seq]
+	jb.slots[seq] = data
 
-	// SwapPointer writes the new data pointer into the slot.
-	// It returns the OLD value.
-	old := atomic.SwapPointer(&jb.slots[seq], ptr)
-
-	// If old was nil, this is a new packet -> Increment count.
 	if old == nil {
-		atomic.AddInt32(&jb.count, 1)
+		jb.count++
 	} else {
 		// If old was NOT nil, we overwrote a packet (duplicate or stalled).
 		// We must release the old packet back to the pool to prevent leaks.
-		releasePacket((*[]byte)(old))
+		releasePacket(old)
 	}
 
-	// Re-validate Horizon
-	// Race Condition Handling: Another thread might have advanced latestSeq
-	// significantly while we were working.
-	newLatest := uint16(atomic.LoadUint32(&jb.latestSeq))
-	if int16(seq-newLatest) < -MaxDropout {
-		// Note: We might be removing the packet we just inserted, or a newer one
-		// if a race occurred. Swapping nil handles cleanup correctly.
-		if removed := atomic.SwapPointer(&jb.slots[seq], nil); removed != nil {
-			atomic.AddInt32(&jb.count, -1)
-			releasePacket((*[]byte)(removed))
-		}
-		return
-	}
-
-	// Update latestSeq (Compare-and-Swap loop)
-	for {
-		currentLatest := atomic.LoadUint32(&jb.latestSeq)
-		currentLatest16 := uint16(currentLatest)
-
-		if int16(seq-currentLatest16) <= 0 {
-			// Current latest is already ahead or equal to this seq.
-			break
-		}
-
-		if atomic.CompareAndSwapUint32(&jb.latestSeq, currentLatest, uint32(seq)) {
-			break
-		}
-		// CAS failed, retry
+	// Update latestSeq if this packet is newer
+	if diff > 0 {
+		jb.latestSeq = seq
 	}
 }
 
@@ -198,25 +173,29 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 //
 // This method MUST ONLY be called by the single audio consumer thread (e.g., the audio callback).
 func (jb *JitterBuffer) Pop() *[]byte {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+
 	// Buffering State Logic
 	// If we are in buffering mode, wait until we hit targetDepth.
 	if jb.buffering {
-		currentLevel := atomic.LoadInt32(&jb.count)
-		if int(currentLevel) >= jb.targetDepth {
+		if jb.count >= jb.targetDepth {
 			jb.buffering = false
 
 			// Fast-Forward Logic:
 			// If we buffered for too long, the "latest" might be far ahead.
 			// Jump the read head (lastPopped) to [latest - depth] to reduce latency.
-			latest := uint16(atomic.LoadUint32(&jb.latestSeq))
+			latest := jb.latestSeq
 			newLastPopped := latest - uint16(jb.targetDepth)
 
 			if jb.lastPopped != newLastPopped {
 				// Clean up skipped slots to correct the count and free memory
+				// Iterate circular range (wrap-around safe)
 				for i := uint16(jb.lastPopped + 1); i != newLastPopped; i++ {
-					if ptr := atomic.SwapPointer(&jb.slots[i], nil); ptr != nil {
-						atomic.AddInt32(&jb.count, -1)
-						releasePacket((*[]byte)(ptr))
+					if ptr := jb.slots[i]; ptr != nil {
+						jb.slots[i] = nil
+						jb.count--
+						releasePacket(ptr)
 					}
 				}
 				jb.lastPopped = newLastPopped
@@ -229,19 +208,18 @@ func (jb *JitterBuffer) Pop() *[]byte {
 
 	// Retrieve Next Packet
 	next := jb.lastPopped + 1
-
-	// Atomic Swap: Get data and set slot to nil (consumes the packet)
-	ptr := atomic.SwapPointer(&jb.slots[next], nil)
+	ptr := jb.slots[next]
+	jb.slots[next] = nil // Consume
 	jb.lastPopped = next
 
 	if ptr != nil {
-		atomic.AddInt32(&jb.count, -1)
-		return (*[]byte)(ptr)
+		jb.count--
+		return ptr
 	}
 
 	// Underrun / Packet Loss
 	// If buffer is completely empty, re-enter buffering state.
-	if atomic.LoadInt32(&jb.count) == 0 {
+	if jb.count == 0 {
 		jb.buffering = true
 	}
 
@@ -252,25 +230,27 @@ func (jb *JitterBuffer) Pop() *[]byte {
 // Cleanup releases all buffered packets back to the pool and marks the buffer as closed.
 // It must be called when removing a peer to prevent memory leaks of pooled buffers.
 func (jb *JitterBuffer) Cleanup() {
-	// Mark closed to stop new pushes
-	if !atomic.CompareAndSwapInt32(&jb.closed, 0, 1) {
-		return // Already closed
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+
+	if jb.closed {
+		return
 	}
+	jb.closed = true
 
 	// Iterate all slots and free any remaining packets
-	// Note: We scan the whole array. Since this happens only on disconnect,
-	// the overhead of 65k iterations is acceptable for leak safety.
 	for i := 0; i < len(jb.slots); i++ {
-		if ptr := atomic.SwapPointer(&jb.slots[i], nil); ptr != nil {
-			releasePacket((*[]byte)(ptr))
-			atomic.AddInt32(&jb.count, -1)
+		if ptr := jb.slots[i]; ptr != nil {
+			jb.slots[i] = nil
+			releasePacket(ptr)
+			jb.count--
 		}
 	}
 }
 
 // Audio Engine
 
-// Engine manages the audio hardware interface (via Malgo/PortAudio) and the mixing pipeline.
+// Engine manages the audio hardware interface (via Malgo) and the mixing pipeline.
 // It handles capture, encoding, networking callbacks, mixing, decoding, and playback.
 type Engine struct {
 	context *malgo.AllocatedContext
@@ -326,7 +306,7 @@ func (e *Engine) IsMuted() bool {
 	return atomic.LoadInt32(&e.muted) == 1
 }
 
-// EnsureContext initializes the underlying audio context (Malgo/PortAudio) if it is not already active.
+// EnsureContext initializes the underlying audio context (Malgo) if it is not already active.
 func (e *Engine) EnsureContext() error {
 	if e.context != nil {
 		return nil

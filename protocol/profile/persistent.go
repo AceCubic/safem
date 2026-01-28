@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	bstd "github.com/banditmoscow1337/benc/std/golang"
 	"github.com/banditmoscow1337/safem/protocol/cryptolib"
@@ -16,6 +17,8 @@ func (messageEntry *MessageEntry) Size() (s int) {
 	s += bstd.SizeBytes(messageEntry.Signature)
 	s += bstd.SizeString(messageEntry.Content)
 	s += bstd.SizeUint64() // Sequence
+	s += bstd.SizeString(messageEntry.ParentHash)
+	s += bstd.SizeString(messageEntry.Hash)
 	return
 }
 
@@ -26,6 +29,8 @@ func (messageEntry *MessageEntry) Marshal(tn int, b []byte) (n int) {
 	n = bstd.MarshalBytes(n, b, messageEntry.Signature)
 	n = bstd.MarshalString(n, b, messageEntry.Content)
 	n = bstd.MarshalUint64(n, b, messageEntry.Sequence)
+	n = bstd.MarshalString(n, b, messageEntry.ParentHash)
+	n = bstd.MarshalString(n, b, messageEntry.Hash)
 	return n
 }
 
@@ -48,6 +53,14 @@ func (messageEntry *MessageEntry) Unmarshal(tn int, b []byte) (n int, err error)
 		messageEntry.Sequence = 0
 		// Reset err if it was just EOF/Short
 		err = nil 
+	}
+	if n, messageEntry.ParentHash, err = bstd.UnmarshalString(n, b); err != nil {
+		messageEntry.ParentHash = ""
+		err = nil
+	}
+	if n, messageEntry.Hash, err = bstd.UnmarshalString(n, b); err != nil {
+		messageEntry.Hash = ""
+		err = nil
 	}
 	return
 }
@@ -138,6 +151,7 @@ func (group *Group) Size() (s int) {
 	s += bstd.SizeSlice(group.Members, func(v string) int { return bstd.SizeString(v) })
 	s += bstd.SizeString(group.OwnerID)
 	s += bstd.SizeMap(group.VectorClock, func(k string) int { return bstd.SizeString(k) }, func(v uint64) int { return bstd.SizeUint64() })
+	s += bstd.SizeString(group.LastMsgHash)
 	return
 }
 
@@ -148,6 +162,7 @@ func (group *Group) Marshal(tn int, b []byte) (n int) {
 	n = bstd.MarshalSlice(n, b, group.Members, func(n int, b []byte, v string) int { return bstd.MarshalString(n, b, v) })
 	n = bstd.MarshalString(n, b, group.OwnerID)
 	n = bstd.MarshalMap(n, b, group.VectorClock, func(n int, b []byte, k string) int { return bstd.MarshalString(n, b, k) }, func(n int, b []byte, v uint64) int { return bstd.MarshalUint64(n, b, v) })
+	n = bstd.MarshalString(n, b, group.LastMsgHash)
 	return n
 }
 
@@ -180,6 +195,10 @@ func (group *Group) Unmarshal(tn int, b []byte) (n int, err error) {
 	}); err != nil {
 		// Tolerate missing VC for old profiles
 		group.VectorClock = make(map[string]uint64)
+		err = nil
+	}
+	if n, group.LastMsgHash, err = bstd.UnmarshalString(n, b); err != nil {
+		group.LastMsgHash = ""
 		err = nil
 	}
 	return
@@ -430,5 +449,32 @@ func (p *Profile) Save() error {
 	finalBuf.Write(salt)
 	finalBuf.Write(encryptedData)
 
-	return os.WriteFile(p.filePath, finalBuf.Bytes(), 0600)
+	// Atomic Write: Write to temp file first, then rename to final path.
+	// This prevents corruption on crash/power loss.
+	dir := filepath.Dir(p.filePath)
+	tmpFile, err := os.CreateTemp(dir, "safem_profile_*.tmp")
+	if err != nil {
+		return err
+	}
+	
+	// Clean up temp file in case of failure before rename
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(finalBuf.Bytes()); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	
+	// Flush to disk
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return err
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	// Atomic Move
+	return os.Rename(tmpFile.Name(), p.filePath)
 }

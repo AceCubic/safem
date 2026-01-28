@@ -22,7 +22,7 @@ go get github.com/banditmoscow1337/safem
 
 ```
 
-*Note: You will need `libopus` and `portaudio`/`alsa` headers installed on your system for the audio engine dependencies.*
+*Note: You will need `libopus` headers installed on your system for the audio engine dependencies.*
 
 ## Quick Start
 

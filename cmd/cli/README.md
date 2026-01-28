@@ -12,7 +12,7 @@ The reference Terminal User Interface (TUI) client for the SAFEM protocol. This 
 
 ## Prerequisites
 
-This client requires **CGO** enabled and specific system libraries for audio hardware access (`malgo`/PortAudio) and encoding (`libopus`).
+This client requires **CGO** enabled and specific system libraries for audio hardware access (`malgo`) and encoding (`libopus`).
 
 ### Linux (Debian/Ubuntu)
 ```bash
@@ -24,7 +24,7 @@ sudo apt-get install -y libopus-dev libasound2-dev gcc pkg-config
 ### macOS
 
 ```bash
-brew install opus portaudio
+brew install opus
 
 ```
 

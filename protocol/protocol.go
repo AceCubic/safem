@@ -53,6 +53,13 @@ const (
 
 	// Relay
 	OpRelay           OpCode = 0x28
+
+	// PIR (Private Information Retrieval) for Relay
+	OpPIRQuery        OpCode = 0x29
+	OpPIRResponse     OpCode = 0x30
+
+	// Security / Audit
+	OpRootBroadcast   OpCode = 0x2A // Gossip latest Server Root Hash to detect Split View
 )
 
 const (

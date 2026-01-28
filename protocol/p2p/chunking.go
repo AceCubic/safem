@@ -18,7 +18,7 @@ import (
 const (
 	// MaxConcurrentChunks limits the number of active incoming file transfers
 	// to prevent memory exhaustion or disk spamming.
-	MaxConcurrentChunks = 10
+	MaxConcurrentChunks = 32
 
 	// MaxChunksPerPeer limits the number of active transfers allowed from a single peer.
 	MaxChunksPerPeer = 3

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"container/list"
 	"context"
 	"crypto/cipher"
 	"encoding/binary"
@@ -36,11 +37,10 @@ const (
 	// IngressBurstLimit is the maximum burst size allowed.
 	IngressBurstLimit = 100
 
-	// LimiterCleanupInterval controls how often we purge stale IPs from the limiter map.
-	LimiterCleanupInterval = 5 * time.Minute
-
-	// LimiterStaleDuration is the time after which an inactive IP is removed from tracking.
-	LimiterStaleDuration = 10 * time.Minute
+	// MaxTrackedIPs limits the number of unique IPs tracked for rate limiting.
+	// This prevents OOM attacks via IP spoofing (UDP Flood with random source IPs).
+	// 10,000 entries ~1-2MB overhead.
+	MaxTrackedIPs = 10000
 )
 
 // Transport manages the underlying UDP connection and the ingress packet processing loop.
@@ -50,17 +50,66 @@ type Transport struct {
 
 	// Callbacks to interact with the Peer's session and handling layers.
 	GetSession func(addr string) (*Session, bool)
-	Dispatch   func(remote *net.UDPAddr, sess *Session, keyID uint32, pkt protocol.Packet)
+	Dispatch   func(remote *net.UDPAddr, sess *Session, keyID uint64, pkt protocol.Packet)
 	Logger     func(format string, args ...any)
 
 	// Metrics Pointer
 	PacketsDropped *atomic.Uint64
 
 	// Rate Limiting
-	limiterMu   sync.Mutex
-	limiters    map[string]*rate.Limiter
-	lastSeen    map[string]time.Time
-	stopCleanup chan struct{}
+	limiterMu sync.Mutex
+	limiters  *rateLimitLRU
+}
+
+// rateLimitLRU is a fixed-size Least Recently Used cache for rate limiters.
+// It prevents memory exhaustion if an attacker spoofs millions of source IPs.
+type rateLimitLRU struct {
+	capacity int
+	ll       *list.List
+	cache    map[string]*list.Element
+}
+
+type lruEntry struct {
+	ip      string
+	limiter *rate.Limiter
+}
+
+func newRateLimitLRU(capacity int) *rateLimitLRU {
+	return &rateLimitLRU{
+		capacity: capacity,
+		ll:       list.New(),
+		cache:    make(map[string]*list.Element),
+	}
+}
+
+func (c *rateLimitLRU) get(ip string) *rate.Limiter {
+	if elem, ok := c.cache[ip]; ok {
+		c.ll.MoveToFront(elem)
+		return elem.Value.(*lruEntry).limiter
+	}
+	return nil
+}
+
+func (c *rateLimitLRU) add(ip string, lim *rate.Limiter) {
+	// If exists, update and move to front
+	if elem, ok := c.cache[ip]; ok {
+		c.ll.MoveToFront(elem)
+		elem.Value.(*lruEntry).limiter = lim
+		return
+	}
+
+	// Add new entry
+	ele := c.ll.PushFront(&lruEntry{ip, lim})
+	c.cache[ip] = ele
+
+	// Evict oldest if capacity exceeded
+	if c.ll.Len() > c.capacity {
+		if old := c.ll.Back(); old != nil {
+			c.ll.Remove(old)
+			kv := old.Value.(*lruEntry)
+			delete(c.cache, kv.ip)
+		}
+	}
 }
 
 // Start binds the UDP listener and starts the listen loop.
@@ -73,52 +122,24 @@ func (t *Transport) Start(port int) (string, error) {
 	}
 	t.conn = conn
 
-	// Initialize Rate Limiting state
-	t.limiters = make(map[string]*rate.Limiter)
-	t.lastSeen = make(map[string]time.Time)
-	t.stopCleanup = make(chan struct{})
-
-	// Start background cleanup for rate limiters
-	go t.cleanupLimiters()
+	// Initialize Rate Limiting state with LRU
+	t.limiters = newRateLimitLRU(MaxTrackedIPs)
 
 	go t.listenLoop()
 	return conn.LocalAddr().String(), nil
 }
 
-// cleanupLimiters removes stale limiters to prevent memory leaks from old IPs.
-func (t *Transport) cleanupLimiters() {
-	ticker := time.NewTicker(LimiterCleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-t.stopCleanup:
-			return
-		case <-ticker.C:
-			t.limiterMu.Lock()
-			now := time.Now()
-			for ip, seen := range t.lastSeen {
-				if now.Sub(seen) > LimiterStaleDuration {
-					delete(t.limiters, ip)
-					delete(t.lastSeen, ip)
-				}
-			}
-			t.limiterMu.Unlock()
-		}
-	}
-}
-
 // allowIP checks if the IP is allowed to send packets based on rate limits.
+// It uses an LRU cache to track active IPs, preventing OOM attacks.
 func (t *Transport) allowIP(ip string) bool {
 	t.limiterMu.Lock()
 	defer t.limiterMu.Unlock()
 
-	lim, exists := t.limiters[ip]
-	if !exists {
+	lim := t.limiters.get(ip)
+	if lim == nil {
 		lim = rate.NewLimiter(rate.Limit(IngressRateLimit), IngressBurstLimit)
-		t.limiters[ip] = lim
+		t.limiters.add(ip, lim)
 	}
-	t.lastSeen[ip] = time.Now()
 
 	return lim.Allow()
 }
@@ -193,21 +214,24 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
+			t.Logger("[Net] Rate limit exceeded for %s\n", remote.String())
 			// Silently drop to prevent CPU exhaustion
 			return
 		}
 	}
 
-	if len(data) < 4 {
+	// FIX: WireID is 8 bytes. Minimum packet size is 8 (ID) + Payload.
+	if len(data) < 8 {
 		if t.PacketsDropped != nil {
 			t.PacketsDropped.Add(1)
 		}
+		t.Logger("[Net] Dropped short packet (%d bytes) from %s\n", len(data), remote.String())
 		return
 	}
 
 	// WireID identifies the session (or 0 for cleartext)
-	keyID := binary.BigEndian.Uint32(data[0:4])
-	body := data[4:]
+	keyID := binary.BigEndian.Uint64(data[0:8])
+	body := data[8:] // FIX: Correctly slice after 8 bytes
 
 	var pkt protocol.Packet
 	var err error
@@ -217,13 +241,14 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 	if keyID == 0 {
 		pkt, err = protocol.UnmarshalPacket(body)
 		if err != nil {
+			t.Logger("[Net] Unmarshal failed for cleartext packet from %s: %v\n", remote.String(), err)
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
 			return
 		}
 		if pkt.Op != protocol.OpHandshake && pkt.Op != protocol.OpPunch {
-			t.Logger("[Net] Dropped Cleartext non-handshake packet from %s\n", remote.String())
+			t.Logger("[Net] Dropped Cleartext non-handshake packet (Op %d) from %s\n", pkt.Op, remote.String())
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
@@ -241,6 +266,8 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 				if t.PacketsDropped != nil {
 					t.PacketsDropped.Add(1)
 				}
+				// Log once per IP to avoid spam? Or just log.
+				// t.Logger("[Net] Dropped encrypted packet from unknown session %s (WireID: %x)\n", remote.String(), keyID)
 				return
 			}
 		}
@@ -250,6 +277,7 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
+			t.Logger("[Net] WireID mismatch from %s. Expected %x, got %x\n", remote.String(), sess.WireID, keyID)
 			return // Mismatch
 		}
 
@@ -283,44 +311,18 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 		nonce := body[offset : offset+12]
 		ciphertext := body[offset+12:]
 
-		// Handle Ratchet Step *BEFORE* Decryption
-		if newRemoteKey != nil {
-			// Atomic Check-and-Mix to prevent race conditions
-			if _, err := sess.CheckAndMixRatchet(newRemoteKey); err != nil {
-				t.Logger("[Ratchet] Mix failed: %v\n", err)
-			}
-		}
-
-		sess.Lock()
-		sess.LastRx = time.Now()
-
-		// Retrieve correct Message Key via Symmetric Ratchet
-		// This uses the chain state potentially updated by MixRatchet above
-		_, currentAEAD, err := sess.GetDecryptionKey(seqID)
-		sess.Unlock()
-
-		if err != nil {
-			if t.PacketsDropped != nil {
-				t.PacketsDropped.Add(1)
-			}
-			return
-		}
-
+		// SAFE DECRYPTION: Attempt decryption *before* committing any Ratchet state.
+		// We reuse the 'ciphertext' backing array (part of pooled buffer) as the destination
+		// for the decrypted plaintext by passing ciphertext[:0].
 		var dec []byte
-		if currentAEAD != nil {
-			// We reuse the 'ciphertext' backing array (which is part of our pooled buffer)
-			// as the destination for the decrypted plaintext.
-			// ciphertext[:0] keeps the capacity but resets length.
-			dec, err = currentAEAD.Open(ciphertext[:0], nonce, ciphertext, nil)
-		} else {
-			err = fmt.Errorf("session cipher not ready")
-		}
+		dec, err = sess.DecryptAndCommit(seqID, newRemoteKey, ciphertext, nonce, nil, ciphertext[:0])
 
 		if err != nil {
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
-			return // Decryption failed
+			t.Logger("[Net] Decryption failed for %s (Seq %d): %v\n", remote.String(), seqID, err)
+			return // Decryption failed, session state remains consistent
 		}
 
 		// pkt.Payload now points to a slice of 'dec', which is inside our pooled buffer.
@@ -329,12 +331,14 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
+			t.Logger("[Net] Unmarshal failed for decrypted packet from %s: %v\n", remote.String(), err)
 			return
 		}
 		if pkt.SequenceID != seqID {
 			if t.PacketsDropped != nil {
 				t.PacketsDropped.Add(1)
 			}
+			t.Logger("[Net] Sequence ID tampering detected from %s\n", remote.String())
 			return // Mismatch implies tampering
 		}
 	}
@@ -346,7 +350,7 @@ func (t *Transport) ProcessPacket(remote *net.UDPAddr, overrideSess *Session, da
 }
 
 // dispatchPacket routes a decoded packet to the appropriate handler or waiting RPC channel.
-func (p *Peer) dispatchPacket(remote *net.UDPAddr, sess *Session, keyID uint32, pkt protocol.Packet) {
+func (p *Peer) dispatchPacket(remote *net.UDPAddr, sess *Session, keyID uint64, pkt protocol.Packet) {
 	if pkt.Op == protocol.OpPunch {
 		return // NAT keep-alive, no processing needed
 	}
@@ -406,8 +410,14 @@ func (p *Peer) dispatchPacket(remote *net.UDPAddr, sess *Session, keyID uint32, 
 	}
 
 	var resp []byte
+	var err error
+
 	if ok {
-		resp, _ = handler(remote, pkt.Payload)
+		resp, err = handler(remote, pkt.Payload)
+		if err != nil {
+			p.Logger("[P2P] Error handling Op %v from %s: %v\n", pkt.Op, remote.String(), err)
+			return // Don't send ACK if handler failed
+		}
 	}
 
 	// Default ACK for Ping if no specific response
@@ -470,15 +480,13 @@ func (p *Peer) sealPacket(sess *Session, pkt protocol.Packet) ([]byte, error) {
 	// Reset but keep capacity
 	finalBuf := (*bufPtr)[:0]
 
-	// Random Nonce Generation
-	nonce, err := cryptolib.GenerateRandomBytes(12)
-	if err != nil {
-		sendBufferPool.Put(bufPtr)
-		return nil, err
-	}
+	// Deterministic Nonce Generation
+	// We use the sequence number to generate a unique nonce for this message key.
+	// This prevents the Birthday Paradox issue with random nonces in high-throughput streams.
+	nonce := cryptolib.GenerateDeterministicNonce(seqID)
 
-	// Header: [WireID 4][SeqID 8][Flag 1][RatchetKey?][Nonce 12]
-	finalBuf = binary.BigEndian.AppendUint32(finalBuf, wireID)
+	// Header: [WireID 8][SeqID 8][Flag 1][RatchetKey?][Nonce 12]
+	finalBuf = binary.BigEndian.AppendUint64(finalBuf, wireID)
 	finalBuf = binary.BigEndian.AppendUint64(finalBuf, seqID)
 
 	var flag uint8 = 0
@@ -521,7 +529,7 @@ func (p *Peer) sendPacket(targetAddr string, pkt protocol.Packet) error {
 		targetID := sess.ID
 
 		// Use bstd to pack: [Len][ID][InnerData]
-		// Actually, standard manual pack is safer with protocol utils.
+		// actually standard manual pack is safer with protocol utils
 		// server expects: PackStrings(id) + innerData. But PackStrings uses Benc encoding for strings.
 		// Let's use bstd.MarshalString + append.
 
@@ -536,7 +544,7 @@ func (p *Peer) sendPacket(targetAddr string, pkt protocol.Packet) error {
 	}
 
 	var currentAEAD cipher.AEAD
-	var wireID uint32
+	var wireID uint64
 	var ratchetPub []byte
 	var seqID uint64
 
@@ -585,13 +593,12 @@ func (p *Peer) sendPacket(targetAddr string, pkt protocol.Packet) error {
 		marshaled := protocol.MarshalPacket(pkt)
 		defer protocol.FreePacketBuffer(marshaled)
 
-		nonce, err := cryptolib.GenerateRandomBytes(12)
-		if err != nil {
-			return err
-		}
+		// Deterministic Nonce Generation
+		// Replaces GenerateRandomBytes to avoid Birthday Paradox collisions in high-throughput streams.
+		nonce := cryptolib.GenerateDeterministicNonce(seqID)
 
-		// Header: [WireID 4][SeqID 8][Flag 1][RatchetKey?][Nonce 12]
-		finalBuf = binary.BigEndian.AppendUint32(finalBuf, wireID)
+		// Header: [WireID 8][SeqID 8][Flag 1][RatchetKey?][Nonce 12]
+		finalBuf = binary.BigEndian.AppendUint64(finalBuf, wireID)
 		finalBuf = binary.BigEndian.AppendUint64(finalBuf, seqID)
 
 		var flag uint8 = 0
@@ -617,7 +624,8 @@ func (p *Peer) sendPacket(targetAddr string, pkt protocol.Packet) error {
 		marshaled := protocol.MarshalPacket(pkt)
 		defer protocol.FreePacketBuffer(marshaled)
 
-		finalBuf = binary.BigEndian.AppendUint32(finalBuf, 0)
+		// FIXED: WireID is now 8 bytes for cleartext packets as well
+		finalBuf = binary.BigEndian.AppendUint64(finalBuf, 0)
 		finalBuf = append(finalBuf, marshaled...)
 	}
 
@@ -729,9 +737,10 @@ func (p *Peer) HolePunch(targetAddr string) {
 
 			marshaled := protocol.MarshalPacket(pkt)
 
-			finalBuf := make([]byte, 4+len(marshaled))
-			binary.BigEndian.PutUint32(finalBuf[0:4], 0)
-			copy(finalBuf[4:], marshaled)
+			// FIXED: Use 8 bytes for WireID (uint64)
+			finalBuf := make([]byte, 8+len(marshaled))
+			binary.BigEndian.PutUint64(finalBuf[0:8], 0)
+			copy(finalBuf[8:], marshaled)
 
 			protocol.FreePacketBuffer(marshaled)
 

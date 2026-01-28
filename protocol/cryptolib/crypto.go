@@ -297,6 +297,20 @@ func GenerateRandomBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
+// GenerateDeterministicNonce generates a unique 12-byte nonce based on a sequence number.
+// Structure: [0x00 ... 0x00] [SeqID (8 bytes, BigEndian)]
+//
+// This guarantees uniqueness as long as the key is unique per session or the
+// sequence number is monotonically increasing for a given key.
+// It effectively acts as XORing the sequence number into a zero-based IV.
+func GenerateDeterministicNonce(seq uint64) []byte {
+	nonce := make([]byte, NonceSize)
+	// Write SeqID to the last 8 bytes (Big Endian)
+	// The first 4 bytes remain 0x00 (padding)
+	binary.BigEndian.PutUint64(nonce[NonceSize-8:], seq)
+	return nonce
+}
+
 // NewAEAD creates a reused cipher.AEAD instance (AES-GCM) from a given key.
 // Using this avoids key expansion overhead per packet in high-throughput sessions.
 func NewAEAD(key []byte) (cipher.AEAD, error) {
@@ -307,11 +321,19 @@ func NewAEAD(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// EncryptSymmetric encrypts data using AES-256-GCM.
+// EncryptSymmetric encrypts data using AES-256-GCM with a random nonce.
 // It generates a random 12-byte nonce and prepends it to the ciphertext.
+//
+// Use this for single-shot encryption (e.g., file storage) where a sequence number
+// is not available. For streams, use EncryptSymmetricWithNonce.
 func EncryptSymmetric(msg []byte, key []byte, additionalData []byte) ([]byte, error) {
 	nonce, _ := GenerateRandomBytes(NonceSize)
+	return EncryptSymmetricWithNonce(msg, key, nonce, additionalData)
+}
 
+// EncryptSymmetricWithNonce encrypts data using AES-256-GCM with a specific nonce.
+// It prepends the nonce to the ciphertext [Nonce][Ciphertext][Tag].
+func EncryptSymmetricWithNonce(msg []byte, key []byte, nonce []byte, additionalData []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -319,6 +341,10 @@ func EncryptSymmetric(msg []byte, key []byte, additionalData []byte) ([]byte, er
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(nonce) != gcm.NonceSize() {
+		return nil, errors.New("invalid nonce size")
 	}
 
 	// Allocate ONE slice for Nonce + Ciphertext + Tag

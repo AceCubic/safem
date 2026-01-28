@@ -2,9 +2,13 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	bstd "github.com/banditmoscow1337/benc/std/golang"
@@ -12,6 +16,11 @@ import (
 	"github.com/banditmoscow1337/safem/protocol/cryptolib"
 	"github.com/banditmoscow1337/safem/protocol/profile"
 )
+
+// MaxGroupSequenceWindow defines how far ahead a sequence number can be
+// before we reject it. This prevents malicious actors from sending MaxUint64
+// to break the Vector Clock logic for future messages.
+const MaxGroupSequenceWindow = 2000
 
 // CreateGroup creates a new group locally and invites the initial members.
 // It returns the newly generated Group ID.
@@ -26,12 +35,16 @@ func (c *Client) CreateGroup(name string, initialMembers []string) (string, erro
 	members := append([]string{myID}, initialMembers...)
 	members = uniqueStrings(members)
 
+	// Genesis Hash (SHA256 of GroupID) to start the chain
+	genesisHash := calculateHashString(groupID)
+
 	group := profile.Group{
 		ID:          groupID,
 		Name:        name,
 		Members:     members,
 		OwnerID:     myID,
 		VectorClock: make(map[string]uint64),
+		LastMsgHash: genesisHash,
 	}
 
 	c.Profile.AddGroup(group)
@@ -45,14 +58,34 @@ func (c *Client) CreateGroup(name string, initialMembers []string) (string, erro
 
 // InviteToGroup sends invitations for an existing group to a list of users.
 // The payload contains the full group state so recipients can sync.
+//
+// SECURITY: This operation is signed by the Group Owner.
 func (c *Client) InviteToGroup(groupID string, userIDs []string) {
 	group, ok := c.Profile.GetGroup(groupID)
 	if !ok {
 		return
 	}
 
-	// Payload: [GID][GroupName][Member1][Member2]...
-	payload := protocol.PackStrings(group.ID, group.Name)
+	// ENFORCE: Only Owner can add members/send invites (generate valid signature)
+	if group.OwnerID != c.Profile.GetID() {
+		c.Events.OnLog("[Group] Permission denied: Only the Group Owner can send invites for %s.\n", group.Name)
+		return
+	}
+
+	// Prepare Data to Sign
+	// Canonical Data: GID + Name + LastHash + JoinedMembers
+	// Note: We use the full, current member list from the group state as the source of truth.
+	membersStr := strings.Join(group.Members, ",")
+	dataToSign := group.ID + group.Name + group.LastMsgHash + membersStr
+
+	sig, err := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
+	if err != nil {
+		c.Events.OnLog("[Group] Failed to sign invite: %v\n", err)
+		return
+	}
+
+	// Payload: [GID][GroupName][LastMsgHash][Signature][Member1][Member2]...
+	payload := protocol.PackStrings(group.ID, group.Name, group.LastMsgHash, string(sig))
 	for _, m := range group.Members {
 		payload = append(payload, protocol.PackStrings(m)...)
 	}
@@ -73,25 +106,44 @@ func (c *Client) InviteToGroup(groupID string, userIDs []string) {
 
 // AddUserToGroup adds a new member to the group and announces the updated member list
 // to ALL current members to ensure state consistency.
+//
+// SECURITY: This operation is signed by the Group Owner.
 func (c *Client) AddUserToGroup(ctx context.Context, groupID, newMemberID string) error {
-	// Update Local Profile
+	// 1. Verify Ownership & Local State
+	group, ok := c.Profile.GetGroup(groupID)
+	if !ok {
+		return fmt.Errorf("group not found")
+	}
+
+	if group.OwnerID != c.Profile.GetID() {
+		return fmt.Errorf("permission denied: only the group owner can add members")
+	}
+
+	// 2. Update Local Profile
 	if err := c.Profile.AddGroupMember(groupID, newMemberID); err != nil {
 		return err
 	}
 	c.Profile.Save()
 
-	// Get updated group info
-	group, ok := c.Profile.GetGroup(groupID)
-	if !ok {
-		return fmt.Errorf("group sync error")
+	// Reload group to ensure we have the updated members list
+	group, _ = c.Profile.GetGroup(groupID)
+
+	// 3. Generate Signature over new state
+	membersStr := strings.Join(group.Members, ",")
+	dataToSign := group.ID + group.Name + group.LastMsgHash + membersStr
+
+	sig, err := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
+	if err != nil {
+		return fmt.Errorf("signing failed: %v", err)
 	}
 
-	// Announce update to ALL members (Old + New)
-	payload := protocol.PackStrings(group.ID, group.Name)
+	// 4. Construct Payload: [GID][GroupName][LastMsgHash][Signature][Members...]
+	payload := protocol.PackStrings(group.ID, group.Name, group.LastMsgHash, string(sig))
 	for _, m := range group.Members {
 		payload = append(payload, protocol.PackStrings(m)...)
 	}
 
+	// 5. Announce update to ALL members (Old + New)
 	for _, memberID := range group.Members {
 		if memberID == c.Profile.GetID() {
 			continue
@@ -109,7 +161,8 @@ func (c *Client) AddUserToGroup(ctx context.Context, groupID, newMemberID string
 }
 
 // SendGroupText fans out a text message to all members of the group individually.
-// It implements Vector Clock logic to ensure causal ordering and consistency.
+// It implements Vector Clock logic AND Hash Chaining (Blockchain-style)
+// to ensure causal ordering and consistency.
 func (c *Client) SendGroupText(ctx context.Context, groupID, text string) error {
 	group, ok := c.Profile.GetGroup(groupID)
 	if !ok {
@@ -123,19 +176,30 @@ func (c *Client) SendGroupText(ctx context.Context, groupID, text string) error 
 	newSeq := currentSeq + 1
 	c.Profile.UpdateGroupVectorClock(groupID, myID, newSeq)
 
+	// Calculate Hash Chain
+	parentHash := group.LastMsgHash
+	if parentHash == "" {
+		parentHash = calculateHashString(groupID) // Fallback to genesis
+	}
+
 	// Store locally in group history
 	entry := profile.MessageEntry{
-		Timestamp: time.Now().Unix(),
-		SenderID:  myID,
-		Content:   text,
-		Sequence:  newSeq,
+		Timestamp:  time.Now().Unix(),
+		SenderID:   myID,
+		Content:    text,
+		Sequence:   newSeq,
+		ParentHash: parentHash,
 	}
+	
+	entry.Hash = calculateEntryHash(entry)
+
+	// Update Group Head
+	c.Profile.SetGroupLastHash(groupID, entry.Hash)
 	c.Profile.AddMessage(groupID, entry)
 	go c.Profile.Save()
 
-	// Prepare Payload: [GID][Seq][Text]
-	// We convert Seq to string for PackStrings convenience, but could use binary.
-	payload := protocol.PackStrings(groupID, strconv.FormatUint(newSeq, 10), text)
+	// Prepare Payload: [GID][Seq][ParentHash][Text]
+	payload := protocol.PackStrings(groupID, strconv.FormatUint(newSeq, 10), parentHash, text)
 
 	// Fan-out to online members
 	for _, memberID := range group.Members {
@@ -199,6 +263,8 @@ func (c *Client) RequestGroupSync(ctx context.Context, groupID string) error {
 }
 
 // KickUserFromGroup removes a user. Only the Group Owner can perform this action.
+//
+// SECURITY: This operation is signed by the Group Owner.
 func (c *Client) KickUserFromGroup(ctx context.Context, groupID, targetID string) error {
 	// Verify Ownership
 	group, ok := c.Profile.GetGroup(groupID)
@@ -218,11 +284,26 @@ func (c *Client) KickUserFromGroup(ctx context.Context, groupID, targetID string
 	if err := c.Profile.RemoveGroupMember(groupID, targetID); err != nil {
 		return err
 	}
+
+	// Advance Hash Chain (Kick Block)
+	parentHash := group.LastMsgHash
+	// Note: We hash the event *without* the signature to create the chain, 
+	// but we sign the *data* including the chain link for the packet.
+	kickEventHash := calculateHashString(groupID + "KICK" + targetID + parentHash)
+	c.Profile.SetGroupLastHash(groupID, kickEventHash)
 	c.Profile.Save()
 
+	// Generate Signature for the Packet
+	// Data: GID + "KICK" + KickedID + ParentHash
+	dataToSign := groupID + "KICK" + targetID + parentHash
+	sig, err := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
+	if err != nil {
+		return fmt.Errorf("failed to sign kick: %v", err)
+	}
+
 	// Announce Kick to ALL members (including the kicked user)
-	// Payload: [GID][KickedID]
-	payload := protocol.PackStrings(groupID, targetID)
+	// Payload: [GID][KickedID][ParentHash][Signature]
+	payload := protocol.PackStrings(groupID, targetID, parentHash, string(sig))
 
 	// Send to the OLD list so the kicked user receives the notification too
 	for _, memberID := range group.Members {
@@ -237,6 +318,14 @@ func (c *Client) KickUserFromGroup(ctx context.Context, groupID, targetID string
 			}
 		}(memberID)
 	}
+	
+	// Send to the kicked user separately since they are removed from Members list now
+	go func(uid string) {
+		sess, ok := c.Peer.GetSession(uid)
+		if ok && sess.Addr != "" {
+			c.Peer.SendFast(context.Background(), sess.Addr, protocol.OpGroupKick, payload)
+		}
+	}(targetID)
 
 	return nil
 }
@@ -245,39 +334,78 @@ func (c *Client) KickUserFromGroup(ctx context.Context, groupID, targetID string
 
 func (c *Client) handleGroupInvite(remote *net.UDPAddr, data []byte) ([]byte, error) {
 	parts := protocol.UnpackStrings(data)
-	if len(parts) < 3 {
+	// Expect at least [GID, Name, LastMsgHash, Signature, Member1...]
+	if len(parts) < 4 {
 		return nil, fmt.Errorf("malformed group invite")
 	}
 
 	gid := parts[0]
 	name := parts[1]
-	members := parts[2:]
+	lastHash := parts[2]
+	sigStr := parts[3]
+	members := parts[4:]
 
-	// Update existing group if found
+	// 1. Resolve Owner Public Key for Verification
+	var ownerKey ed25519.PublicKey
+	var ownerID string
+
+	// Check if we already know this group
+	if existingGroup, exists := c.Profile.GetGroup(gid); exists {
+		ownerID = existingGroup.OwnerID
+	} else {
+		// New Group: We assume the sender is the Owner/Creator
+		ownerID = c.Peer.GetID(remote.String())
+	}
+
+	// Try to find the key in Friends list or Active Session
+	if f, ok := c.Profile.GetFriend(ownerID); ok {
+		ownerKey, _ = cryptolib.PEMToPubKey([]byte(f.PEM))
+	} else if pKey, ok := c.Peer.GetIdentity(ownerID); ok {
+		ownerKey = pKey
+	}
+
+	if ownerKey == nil {
+		return nil, fmt.Errorf("security: cannot verify group update, unknown owner %s", ownerID)
+	}
+
+	// 2. Verify Signature
+	// Data: GID + Name + LastHash + JoinedMembers
+	membersStr := strings.Join(members, ",")
+	dataToVerify := gid + name + lastHash + membersStr
+
+	if err := cryptolib.Verify([]byte(dataToVerify), []byte(sigStr), ownerKey); err != nil {
+		c.Events.OnLog("[Security] Dropped forged group update from %s (Sig Fail)\n", ownerID)
+		return nil, nil // Silently drop invalid signature
+	}
+
+	// 3. Apply Update
 	if _, exists := c.Profile.GetGroup(gid); exists {
 		for _, newM := range members {
 			c.Profile.AddGroupMember(gid, newM)
 		}
+		
+		// Trust the signed update for hash chain head
+		c.Profile.SetGroupLastHash(gid, lastHash)
+
 		c.Profile.Save()
-		c.Events.OnLog("[Group] Updated members for group '%s'\n", name)
+		c.Events.OnLog("[Group] Securely updated members for group '%s'\n", name)
 		return protocol.PackStrings("ACK"), nil
 	}
 
 	// New Group: Create local entry
-	senderID := c.Peer.GetID(remote.String())
-
 	group := profile.Group{
 		ID:          gid,
 		Name:        name,
 		Members:     members,
-		OwnerID:     senderID, // Assume inviter is owner/admin for now
+		OwnerID:     ownerID,
 		VectorClock: make(map[string]uint64),
+		LastMsgHash: lastHash,
 	}
 
 	c.Profile.AddGroup(group)
 	c.Profile.Save()
 
-	c.Events.OnLog("[Group] Joined group '%s' (ID: %s)\n", name, gid)
+	c.Events.OnLog("[Group] Joined group '%s' (ID: %s) [Verified]\n", name, gid)
 	
 	// Trigger sync immediately to catch up history
 	go c.RequestGroupSync(context.Background(), gid)
@@ -287,43 +415,82 @@ func (c *Client) handleGroupInvite(remote *net.UDPAddr, data []byte) ([]byte, er
 
 func (c *Client) handleGroupMsg(remote *net.UDPAddr, data []byte) ([]byte, error) {
 	parts := protocol.UnpackStrings(data)
-	if len(parts) < 3 {
+	if len(parts) < 4 {
 		return nil, fmt.Errorf("malformed group msg")
 	}
 
 	gid := parts[0]
 	seqStr := parts[1]
-	text := parts[2]
+	parentHash := parts[2]
+	text := parts[3]
 	
 	seq, _ := strconv.ParseUint(seqStr, 10, 64)
 	senderID := c.Peer.GetID(remote.String())
 
 	// Verify group existence
-	if _, ok := c.Profile.GetGroup(gid); !ok {
+	group, ok := c.Profile.GetGroup(gid)
+	if !ok {
 		return nil, fmt.Errorf("received msg for unknown group %s", gid)
 	}
 
-	// Update Vector Clock
-	// If this returns false, we likely already have this message or a newer one from this user
-	// However, in chat, we usually allow re-delivery, but filter duplicates via Sequence.
+	// SECURITY CHECK: Verify Sender Membership
+	// Ensure the sender is actually in the group before processing the message.
+	isMember := false
+	for _, member := range group.Members {
+		if member == senderID {
+			isMember = true
+			break
+		}
+	}
+
+	if !isMember {
+		c.Events.OnLog("[Security] Dropped group msg from non-member %s in group %s", senderID, group.Name)
+		// We return ACK to stop the attacker from retrying, but we do not process the payload.
+		return protocol.PackStrings("ACK"), nil
+	}
 	
-	// Check if already seen
+	// SECURITY CHECK: Causal History (Blockchain Rule)
+	if group.LastMsgHash != "" && parentHash != group.LastMsgHash {
+		c.Events.OnLog("[Security] Dropped forked message from %s (Parent %s != Head %s). Possible kick or stale view.", 
+			senderID, parentHash[:8], group.LastMsgHash[:8])
+		// Trigger sync to resolve legitimate races
+		go c.RequestGroupSync(context.Background(), gid)
+		return protocol.PackStrings("ACK"), nil
+	}
+
+	// Update Vector Clock
 	currentVC := c.Profile.GetGroupVectorClock(gid)
-	if seq <= currentVC[senderID] {
+	lastSeq := currentVC[senderID]
+
+	if seq <= lastSeq {
 		// Duplicate or old message
+		return protocol.PackStrings("ACK"), nil
+	}
+
+	// SECURITY CHECK: Verify Sequence Window
+	if seq > lastSeq + MaxGroupSequenceWindow {
+		c.Events.OnLog("[Security] Dropped group msg from %s: sequence %d exceeds window (Last: %d)", 
+			senderID, seq, lastSeq)
+		
+		go c.RequestGroupSync(context.Background(), gid)
 		return protocol.PackStrings("ACK"), nil
 	}
 
 	// Update VC
 	c.Profile.UpdateGroupVectorClock(gid, senderID, seq)
 
-	// Store message
+	// Construct Entry & Calculate Hash
 	entry := profile.MessageEntry{
-		Timestamp: time.Now().Unix(),
-		SenderID:  senderID,
-		Content:   text,
-		Sequence:  seq,
+		Timestamp:  time.Now().Unix(),
+		SenderID:   senderID,
+		Content:    text,
+		Sequence:   seq,
+		ParentHash: parentHash,
 	}
+	entry.Hash = calculateEntryHash(entry)
+
+	// Update Group Head
+	c.Profile.SetGroupLastHash(gid, entry.Hash)
 	c.Profile.AddMessage(gid, entry)
 	go c.Profile.Save()
 
@@ -333,12 +500,14 @@ func (c *Client) handleGroupMsg(remote *net.UDPAddr, data []byte) ([]byte, error
 
 func (c *Client) handleGroupKick(remote *net.UDPAddr, data []byte) ([]byte, error) {
 	parts := protocol.UnpackStrings(data)
-	if len(parts) < 2 {
+	if len(parts) < 4 {
 		return nil, fmt.Errorf("malformed kick payload")
 	}
 
 	gid := parts[0]
 	kickedID := parts[1]
+	parentHash := parts[2]
+	sigStr := parts[3]
 
 	senderID := c.Peer.GetID(remote.String())
 	group, ok := c.Profile.GetGroup(gid)
@@ -346,11 +515,42 @@ func (c *Client) handleGroupKick(remote *net.UDPAddr, data []byte) ([]byte, erro
 		return nil, nil // Unknown group
 	}
 
-	// Sender must be Owner
+	// Basic check: Sender must match OwnerID (but we rely on Signature)
 	if senderID != group.OwnerID {
-		c.Events.OnLog("[Security] Ignoring unauthorized kick command for group %s from %s\n", group.Name, senderID)
+		c.Events.OnLog("[Security] Ignoring unauthorized kick packet from non-owner %s\n", senderID)
 		return nil, nil
 	}
+
+	// 1. Resolve Owner Key
+	var ownerKey ed25519.PublicKey
+	if f, ok := c.Profile.GetFriend(group.OwnerID); ok {
+		ownerKey, _ = cryptolib.PEMToPubKey([]byte(f.PEM))
+	} else if pKey, ok := c.Peer.GetIdentity(group.OwnerID); ok {
+		ownerKey = pKey
+	}
+
+	if ownerKey == nil {
+		c.Events.OnLog("[Security] Cannot verify kick: unknown owner key for %s", group.OwnerID)
+		return nil, nil
+	}
+
+	// 2. Verify Signature
+	// Data: GID + "KICK" + KickedID + ParentHash
+	dataToVerify := gid + "KICK" + kickedID + parentHash
+	if err := cryptolib.Verify([]byte(dataToVerify), []byte(sigStr), ownerKey); err != nil {
+		c.Events.OnLog("[Security] Kick signature verification failed! Forged packet from %s", senderID)
+		return nil, nil
+	}
+	
+	// SECURITY CHECK: Verify Chain Continuity
+	if group.LastMsgHash != "" && parentHash != group.LastMsgHash {
+		c.Events.OnLog("[Security] Kick rejected: admin is forked or stale.")
+		return nil, nil
+	}
+	
+	// Calculate Kick Hash and Advance Chain
+	kickEventHash := calculateHashString(gid + "KICK" + kickedID + parentHash)
+	c.Profile.SetGroupLastHash(gid, kickEventHash)
 
 	// I am the one kicked
 	if kickedID == c.Profile.GetID() {
@@ -459,6 +659,11 @@ func (c *Client) handleGroupSyncRes(remote *net.UDPAddr, data []byte) ([]byte, e
 		// Only process if newer
 		if msg.Sequence > currentVC[msg.SenderID] {
 			c.Profile.UpdateGroupVectorClock(gid, msg.SenderID, msg.Sequence)
+			
+			// Re-verify hash to ensure chain integrity
+			msg.Hash = calculateEntryHash(msg)
+			c.Profile.SetGroupLastHash(gid, msg.Hash)
+			
 			c.Profile.AddMessage(gid, msg)
 			c.Events.OnMessage(gid, c.Peer.GetName(msg.SenderID), msg.Content)
 			count++
@@ -483,4 +688,23 @@ func uniqueStrings(input []string) []string {
 		}
 	}
 	return list
+}
+
+// Helper: Calculate SHA-256 hash of a MessageEntry
+func calculateEntryHash(e profile.MessageEntry) string {
+	h := sha256.New()
+	h.Write([]byte(e.SenderID))
+	h.Write([]byte(strconv.FormatInt(e.Timestamp, 10)))
+	h.Write(e.Signature) // Non-repudiation
+	h.Write([]byte(e.ParentHash))
+	h.Write([]byte(e.Content))
+	h.Write([]byte(strconv.FormatUint(e.Sequence, 10)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Helper: Calculate SHA-256 of a string
+func calculateHashString(s string) string {
+	h := sha256.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
 }

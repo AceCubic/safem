@@ -2,10 +2,13 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/banditmoscow1337/safem/protocol"
+	"github.com/banditmoscow1337/safem/protocol/cryptolib"
 )
 
 // registerHandlers binds all protocol OpCodes to their respective handler functions.
@@ -47,6 +50,79 @@ func (c *Client) registerHandlers() {
 
 	// System
 	c.Peer.RegisterHandler(protocol.OpHeartbeat, c.handleHeartbeat)
+	
+	// Security / Audit
+	c.Peer.RegisterHandler(protocol.OpRootBroadcast, c.handleRootBroadcast)
+}
+
+// handleRootBroadcast processes a peer's report of the server's root hash.
+// It verifies the signature and checks against the local view to detect Split View attacks.
+func (c *Client) handleRootBroadcast(remote *net.UDPAddr, data []byte) ([]byte, error) {
+	parts := protocol.UnpackStrings(data)
+	if len(parts) < 4 {
+		return nil, fmt.Errorf("malformed audit payload")
+	}
+	
+	remoteRoot := parts[0]
+	sizeStr := parts[1]
+	tsStr := parts[2]
+	sigStr := parts[3]
+
+	senderID := c.Peer.GetID(remote.String())
+	if senderID == "" {
+		return nil, nil // Unknown peer
+	}
+	senderName := c.Peer.GetName(senderID)
+
+	// 1. Verify Signature (Sender authentically saw this)
+	friend, ok := c.Profile.GetFriend(senderID)
+	if !ok {
+		return nil, nil
+	}
+	
+	pub, err := cryptolib.PEMToPubKey([]byte(friend.PEM))
+	if err != nil {
+		return nil, fmt.Errorf("invalid friend key")
+	}
+
+	dataToVerify := []byte(remoteRoot + sizeStr + tsStr)
+	if err := cryptolib.Verify(dataToVerify, []byte(sigStr), pub); err != nil {
+		c.Events.OnLog("[Audit] Warning: Invalid signature on root broadcast from %s", senderName)
+		return nil, nil
+	}
+
+	// 2. Check for Split View
+	c.rootMu.RLock()
+	localRoot := c.latestRoot
+	localSize := c.latestTreeSize
+	c.rootMu.RUnlock()
+
+	remoteSize, _ := strconv.Atoi(sizeStr)
+
+	// Logic:
+	// If both clients see the EXACT SAME tree size, the Root Hash MUST be identical.
+	// If they differ, the server has given different Merkle Trees to different users (Split View).
+	if localSize > 0 && remoteSize == localSize {
+		if localRoot != remoteRoot {
+			// CRITICAL SECURITY ALERT
+			msg := fmt.Sprintf("SPLIT VIEW DETECTED! Server is lying. You and %s see different data for Tree Size %d.\nLocal: %s\nRemote: %s", 
+				senderName, localSize, localRoot[:16], remoteRoot[:16])
+			
+			c.Events.OnLog("[SECURITY ALARM] %s", msg)
+			// Ideally, notify user via UI: c.Events.OnSecurityAlert(...)
+		} else {
+			// Verification Success
+			// c.Events.OnLog("[Audit] Consistent view confirmed with %s (Size %d).", senderName, localSize)
+		}
+	} else if localSize > 0 && remoteSize > localSize {
+		// Peer is ahead of us. We haven't seen this size yet, so we can't verify directly
+		// without a consistency proof (OldRoot -> NewRoot). 
+		// For now, we assume valid forward progress.
+	} else if localSize > 0 && remoteSize < localSize {
+		// Peer is behind us.
+	}
+
+	return nil, nil // No response needed
 }
 
 // handleTyping triggers the UI typing indicator.

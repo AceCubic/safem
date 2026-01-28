@@ -43,6 +43,10 @@ type MessageEntry struct {
 	Signature []byte // Ed25519 signature for non-repudiation
 	Content   string
 	Sequence  uint64 // Group Sequence ID for Vector Clocks (0 for DMs)
+	
+	// Causal History (Blockchain-style)
+	ParentHash string // Hash of the previous message in the chain
+	Hash       string // SHA-256 Hash of this entry
 }
 
 // UserContent holds the rich media profile data for a user.
@@ -76,6 +80,10 @@ type Group struct {
 	// VectorClock tracks the highest sequence number seen from each member.
 	// Map: MemberID -> HighestSequence
 	VectorClock map[string]uint64
+
+	// LastMsgHash points to the head of the hash chain for this group.
+	// This enforces strict causal ordering and prevents branching.
+	LastMsgHash string
 }
 
 // Profile stores the user's data and ensures thread-safe access.
@@ -382,6 +390,22 @@ func (p *Profile) UpdateGroupVectorClock(groupID, userID string, seq uint64) boo
 		return true
 	}
 	return false
+}
+
+// SetGroupLastHash updates the hash chain head for the group.
+// This is critical for the Sender Key / Blockchain causal history mechanism.
+func (p *Profile) SetGroupLastHash(groupID, hash string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	g, ok := p.groups[groupID]
+	if !ok {
+		return fmt.Errorf("group not found")
+	}
+
+	g.LastMsgHash = hash
+	p.groups[groupID] = g
+	return nil
 }
 
 // GetMessagesAfter returns messages in a group that are newer than the provided vector clock.

@@ -41,16 +41,12 @@ const (
 	CookieValidity = 30 * time.Second
 
 	// VoicePacketBufferSize is the size of pooled buffers for voice packets.
-	// It is set slightly larger than typical Opus packets (1200 bytes)
-	// to avoid reallocation for standard voice traffic.
 	VoicePacketBufferSize = 2048
 )
 
 // sendBufferPool recycles outbound packet buffers to reduce GC pressure.
 var sendBufferPool = sync.Pool{
 	New: func() any {
-		// Allocate a slice with maximum capacity for standard UDP packets.
-		// We use a pointer to slice to avoid allocation when putting/getting from pool.
 		b := make([]byte, MaxPacketSize)
 		return &b
 	},
@@ -137,10 +133,19 @@ type Peer struct {
 	encIdentities map[string]*ecdh.PublicKey
 	aliases       map[string]string
 
+	// writeTokens maps UserID -> WriteToken (Authentication for sending to Relay)
+	writeTokens map[string]string
+
+	// RelayServerAddr stores the address of the Rendezvous Server used for PIR relaying.
+	RelayServerAddr string
+
 	PendingInvites map[string]InviteData
 	KeysMu         sync.RWMutex
 
+	// Sessions maps PeerID -> *Session
 	Sessions sync.Map
+	// WireIDSessions maps WireID (uint64) -> *Session for O(1) Sealed Sender lookups
+	WireIDSessions sync.Map
 
 	handshakeCache   map[string]time.Time
 	handshakeCacheMu sync.Mutex
@@ -169,7 +174,6 @@ type Peer struct {
 }
 
 // NewPeer initializes a new Peer with the provided cryptographic keys.
-// If keys are nil, new ones will be generated.
 func NewPeer(priv ed25519.PrivateKey, pub ed25519.PublicKey, encPriv *ecdh.PrivateKey, encPub *ecdh.PublicKey) *Peer {
 	if priv == nil || pub == nil {
 		priv, pub, _ = cryptolib.GenerateKeyPair(0)
@@ -193,6 +197,7 @@ func NewPeer(priv ed25519.PrivateKey, pub ed25519.PublicKey, encPriv *ecdh.Priva
 		identities:        make(map[string]ed25519.PublicKey),
 		encIdentities:     make(map[string]*ecdh.PublicKey),
 		aliases:           make(map[string]string),
+		writeTokens:       make(map[string]string),
 		PendingInvites:    make(map[string]InviteData),
 		chunkBuffers:      make(map[uint64]*ChunkBuffer),
 		handshakeCache:    make(map[string]time.Time),
@@ -206,16 +211,14 @@ func NewPeer(priv ed25519.PrivateKey, pub ed25519.PublicKey, encPriv *ecdh.Priva
 	}
 
 	p.transport = &Transport{
-		GetSession: p.GetSessionByAddr,
-		Dispatch:   p.dispatchPacket,
-		Logger:     p.Logger,
-		// Link drops in transport to peer metrics
+		GetSession:     p.GetSessionByAddr,
+		Dispatch:       p.dispatchPacket,
+		Logger:         p.Logger,
 		PacketsDropped: &p.PacketsDropped,
 	}
 
 	p.RegisterHandler(protocol.OpChunk, p.handleChunk)
 	p.RegisterHandler(protocol.OpHandshake, p.handleHandshake)
-	// Register the Relay Handler to unwrap forwarded packets
 	p.RegisterHandler(protocol.OpRelay, p.handleRelayedPacket)
 
 	p.StartChunkGC()
@@ -225,35 +228,24 @@ func NewPeer(priv ed25519.PrivateKey, pub ed25519.PublicKey, encPriv *ecdh.Priva
 }
 
 // Start binds the underlying transport to the specified UDP port.
-// Returns the actual bound address string or an error.
 func (p *Peer) Start(port int) (string, error) {
 	addr, err := p.transport.Start(port)
 	if err != nil {
 		return "", err
 	}
 
-	// Use a sync.Pool for voice buffers instead of allocating a new slice for every packet.
 	p.RegisterHandler(protocol.OpVoice, func(remote *net.UDPAddr, data []byte) ([]byte, error) {
-		// Get buffer from pool
 		ptr := voiceBufferPool.Get().(*[]byte)
-
-		// Ensure capacity
 		if cap(*ptr) < len(data) {
-			// If packet is unusually large, allocate a fresh one (rare case)
-			// to avoid polluting the pool with huge buffers or panicking.
 			b := make([]byte, len(data))
 			ptr = &b
 		}
-
-		// Reslice and copy
 		*ptr = (*ptr)[:len(data)]
 		copy(*ptr, data)
 
 		select {
-		// ZERO-COPY: Send the pointer directly. The consumer MUST free it.
 		case p.VoiceIn <- VoicePacket{Addr: remote.String(), Data: ptr}:
 		default:
-			// Drop voice packet if buffer full and recycle immediately
 			p.PoolStarvation.Add(1)
 			voiceBufferPool.Put(ptr)
 		}
@@ -268,23 +260,18 @@ func (p *Peer) Start(port int) (string, error) {
 	return addr, nil
 }
 
-// RecycleVoiceBufferPtr returns a pointer-based buffer to the pool.
-// It is safe to call with nil.
 func (p *Peer) RecycleVoiceBufferPtr(buf *[]byte) {
 	if buf != nil && cap(*buf) >= VoicePacketBufferSize {
 		voiceBufferPool.Put(buf)
 	}
 }
 
-// GetVoiceBuffer returns a new buffer from the voice pool.
-// This is used for outgoing voice packets to reduce allocation.
 func (p *Peer) GetVoiceBuffer() *[]byte {
 	return voiceBufferPool.Get().(*[]byte)
 }
 
 func (p *Peer) voiceSendLoop() {
 	for pkt := range p.VoiceOut {
-		// SendFast copies the data into the packet buffer, so we can recycle immediately.
 		if pkt.Data != nil {
 			p.SendFast(context.Background(), pkt.Addr, protocol.OpVoice, *pkt.Data)
 			p.RecycleVoiceBufferPtr(pkt.Data)
@@ -292,14 +279,12 @@ func (p *Peer) voiceSendLoop() {
 	}
 }
 
-// RegisterHandler maps a protocol OpCode to a specific handler function.
 func (p *Peer) RegisterHandler(op protocol.OpCode, handler HandlerFunc) {
 	p.handlersMu.Lock()
 	p.handlers[op] = handler
 	p.handlersMu.Unlock()
 }
 
-// TrustPeer adds a trusted peer's identity (Signing and Encryption keys) to the local store.
 func (p *Peer) TrustPeer(id string, signPEM, encPEM []byte) {
 	pub, err := cryptolib.PEMToPubKey(signPEM)
 	if err == nil {
@@ -316,7 +301,28 @@ func (p *Peer) TrustPeer(id string, signPEM, encPEM []byte) {
 	}
 }
 
-// MapPeer associates a network address with a Peer ID and optional alias/nickname.
+// SetWriteToken maps a user ID to their Write Token (auth for sending via relay).
+func (p *Peer) SetWriteToken(id, token string) {
+	p.KeysMu.Lock()
+	p.writeTokens[id] = token
+	p.KeysMu.Unlock()
+}
+
+// GetWriteToken retrieves the Write Token for a user.
+func (p *Peer) GetWriteToken(id string) (string, bool) {
+	p.KeysMu.RLock()
+	defer p.KeysMu.RUnlock()
+	t, ok := p.writeTokens[id]
+	return t, ok
+}
+
+// SetRelayServer updates the address of the relay server used for outbound PIR responses.
+func (p *Peer) SetRelayServer(addr string) {
+	p.KeysMu.Lock()
+	p.RelayServerAddr = addr
+	p.KeysMu.Unlock()
+}
+
 func (p *Peer) MapPeer(addr, id, name string) {
 	p.KeysMu.Lock()
 	defer p.KeysMu.Unlock()
@@ -326,21 +332,18 @@ func (p *Peer) MapPeer(addr, id, name string) {
 	}
 }
 
-// UnmapPeer removes the association between a network address and a Peer ID.
 func (p *Peer) UnmapPeer(addr string) {
 	p.KeysMu.Lock()
 	defer p.KeysMu.Unlock()
 	delete(p.peerIDs, addr)
 }
 
-// GetID resolves a network address to a Peer ID.
 func (p *Peer) GetID(addr string) string {
 	p.KeysMu.RLock()
 	defer p.KeysMu.RUnlock()
 	return p.peerIDs[addr]
 }
 
-// GetIdentity retrieves the Ed25519 signing public key for a given Peer ID.
 func (p *Peer) GetIdentity(id string) (ed25519.PublicKey, bool) {
 	p.KeysMu.RLock()
 	defer p.KeysMu.RUnlock()
@@ -348,7 +351,6 @@ func (p *Peer) GetIdentity(id string) (ed25519.PublicKey, bool) {
 	return pub, ok
 }
 
-// GetEncIdentity retrieves the X25519 encryption public key for a given Peer ID.
 func (p *Peer) GetEncIdentity(id string) (*ecdh.PublicKey, bool) {
 	p.KeysMu.RLock()
 	defer p.KeysMu.RUnlock()
@@ -356,7 +358,6 @@ func (p *Peer) GetEncIdentity(id string) (*ecdh.PublicKey, bool) {
 	return pub, ok
 }
 
-// GetName retrieves the alias/nickname associated with a Peer ID, or returns the ID if unknown.
 func (p *Peer) GetName(id string) string {
 	p.KeysMu.RLock()
 	defer p.KeysMu.RUnlock()
@@ -404,7 +405,6 @@ func (p *Peer) verifyCookie(ip string, cookie []byte) bool {
 	return hmac.Equal(cookie[8:], expectedSum)
 }
 
-// StartHandshakeGC starts a background goroutine to clean up the handshake replay cache.
 func (p *Peer) StartHandshakeGC() {
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)

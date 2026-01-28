@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -16,9 +17,7 @@ import (
 )
 
 // PerformRelayedHandshake attempts to establish a connection with a target peer via a Rendezvous Server.
-// This is used as a fallback when direct P2P connection attempts (and hole punching) fail.
 func (p *Peer) PerformRelayedHandshake(ctx context.Context, targetID, serverAddr string) error {
-	// SingleFlight protection
 	p.handshakeInFlightMu.Lock()
 	key := "relay:" + targetID
 	if ch, ok := p.handshakeInFlight[key]; ok {
@@ -50,6 +49,12 @@ func (p *Peer) PerformRelayedHandshake(ctx context.Context, targetID, serverAddr
 
 	if targetEncPub == nil || targetSignPub == nil {
 		return errors.New("cannot handshake: peer keys unknown")
+	}
+
+	// Retrieve Write Token (Authorization to send via Relay)
+	writeToken, ok := p.GetWriteToken(targetID)
+	if !ok {
+		return errors.New("no write token for sealed sender routing (OpQuery needed)")
 	}
 
 	// Generate Ephemeral Key
@@ -100,7 +105,6 @@ func (p *Peer) PerformRelayedHandshake(ctx context.Context, targetID, serverAddr
 	ciphertext := tunnelAEAD.Seal(nil, nonce, innerBuf.Bytes(), nil)
 
 	// Construct Inner Handshake Packet (Cleartext logic, WireID=0)
-	// [0][EphemPub][Nonce][Cipher] (No cookie support for relay initially)
 	buf := new(bytes.Buffer)
 	buf.WriteByte(0) // No cookie
 	buf.Write(ephemPubBytes)
@@ -118,55 +122,107 @@ func (p *Peer) PerformRelayedHandshake(ctx context.Context, targetID, serverAddr
 
 	marshaledInner := protocol.MarshalPacket(innerPacket)
 
-	// Prepend 0 WireID for Cleartext
-	finalInner := make([]byte, 4+len(marshaledInner))
-	binary.BigEndian.PutUint32(finalInner[0:4], 0)
-	copy(finalInner[4:], marshaledInner)
+	// Prepend 0 WireID for Cleartext using 8 bytes (uint64)
+	finalInner := make([]byte, 8+len(marshaledInner))
+	binary.BigEndian.PutUint64(finalInner[0:8], 0)
+	copy(finalInner[8:], marshaledInner)
 
-	// Wrap in OpRelay Payload: [TargetID][InnerPacket]
-	// Use Benc for TargetID
-	relayBuf := make([]byte, bstd.SizeString(targetID)+len(finalInner))
-	n := bstd.MarshalString(0, relayBuf, targetID)
+	// Wrap in OpRelay Payload: [WriteToken][InnerPacket]
+	relayBuf := make([]byte, bstd.SizeString(writeToken)+len(finalInner))
+	n := bstd.MarshalString(0, relayBuf, writeToken)
 	copy(relayBuf[n:], finalInner)
 
 	// Send OpRelay to Server & Wait for Response
-	respCh := make(chan *protocol.Packet, 1)
-	p.pendingMu.Lock()
-	p.pending[reqID] = respCh
-	p.pendingMu.Unlock()
-	defer func() {
-		p.pendingMu.Lock()
-		delete(p.pending, reqID)
-		p.pendingMu.Unlock()
-	}()
-
-	// Send to Server (Fire-and-forget, the response comes via pending)
 	if err := p.SendFast(ctx, serverAddr, protocol.OpRelay, relayBuf); err != nil {
 		return err
 	}
 
-	var respPayload []byte
-	select {
-	case resp := <-respCh:
-		respPayload = resp.Payload
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("relay handshake timeout")
-	}
+	// Wait for Session to appear (handled by Poller -> handleRelayedPacket -> finishHandshake)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(15 * time.Second)
 
-	// Process Response
-	return p.finishHandshake(targetID, "", respPayload, ephemPriv, ephemPubBytes, targetSignPub, true, serverAddr)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("relay handshake timeout (poller did not retrieve response)")
+		case <-ticker.C:
+			if _, ok := p.GetSession(targetID); ok {
+				return nil
+			}
+		}
+	}
 }
 
+// StartPIR starts the background poller for fetching relayed messages.
+// This implements a bucket-based PIR where we request a shared bucket based on our Read Token (SubID).
+func (p *Peer) StartPIR(ctx context.Context, serverAddr, myReadToken string) {
+	if len(myReadToken) < 2 {
+		p.Logger("[PIR] Invalid Read Token, cannot start poller")
+		return
+	}
+
+	// Store Relay Address in Peer for outbound responses
+	p.SetRelayServer(serverAddr)
+
+	// Derive Bucket Index from Read Token (first byte of hex)
+	bucketIdx, err := strconv.ParseUint(myReadToken[0:2], 16, 8)
+	if err != nil {
+		p.Logger("[PIR] Failed to derive bucket: %v", err)
+		return
+	}
+
+	ticker := time.NewTicker(2 * time.Second) // Poll every 2s
+	defer ticker.Stop()
+
+	p.Logger("[PIR] Starting Poller for Bucket %d (Token: %s...)", bucketIdx, myReadToken[:8])
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Send OpPIRQuery: [BucketIndex]
+			req := make([]byte, 1)
+			req[0] = byte(bucketIdx)
+
+			// We use Call to get the response immediately
+			resp, err := p.Call(ctx, serverAddr, protocol.OpPIRQuery, req)
+			if err != nil {
+				continue
+			}
+
+			// Unpack Messages: [Count][Len][Data][Len][Data]...
+			// The response is a slice of byte slices.
+			var messages [][]byte
+			_, messages, err = bstd.UnmarshalSlice[[]byte](0, resp, func(n int, b []byte, v *[]byte) (int, []byte, error) {
+				return bstd.UnmarshalBytesCopied(n, b)
+			})
+
+			if err != nil {
+				p.Logger("[PIR] Malformed response: %v", err)
+				continue
+			}
+
+			// Process each message found in the bucket
+			for _, msg := range messages {
+				// We don't know who the sender is or if it's for us.
+				// handleRelayedPacket checks WireID or tries to handshake decrypt.
+				p.handleRelayedPacket(nil, msg)
+			}
+		}
+	}
+}
+
+
 // handleIncomingRelayedHandshake processes a handshake request forwarded via the relay.
-func (p *Peer) handleIncomingRelayedHandshake(remote *net.UDPAddr, sourceID string, pkt protocol.Packet) ([]byte, error) {
-	// Parse Payload
+func (p *Peer) handleIncomingRelayedHandshake(remote *net.UDPAddr, pkt protocol.Packet) ([]byte, error) {
 	data := pkt.Payload
 	if len(data) < 1 {
 		return nil, nil
 	}
-	// Relayed handshakes effectively skip the cookie phase for now, relying on server auth
 	cookieLen := int(data[0])
 	if len(data) < 1+cookieLen+32+12 {
 		return nil, nil
@@ -176,9 +232,11 @@ func (p *Peer) handleIncomingRelayedHandshake(remote *net.UDPAddr, sourceID stri
 	nonce := data[1+cookieLen+32 : 1+cookieLen+32+12]
 	ciphertext := data[1+cookieLen+32+12:]
 
-	respPayload, err := p.processIncomingHandshake(remote.String(), ephemPubBytes, nonce, ciphertext, true, remote.String())
+	// Sealed Sender: We extract the sender ID from the internal encrypted payload
+	// Since we are polling, 'remote' is nil or the server. processIncomingHandshake handles logic.
+	respPayload, sourceID, err := p.processIncomingHandshake("RELAY", ephemPubBytes, nonce, ciphertext, true, "RELAY")
 	if err != nil {
-		p.Logger("[Relay] Handshake processing failed: %v\n", err)
+		// Decryption failure is expected for messages in the bucket not meant for us
 		return nil, nil
 	}
 
@@ -193,68 +251,87 @@ func (p *Peer) handleIncomingRelayedHandshake(remote *net.UDPAddr, sourceID stri
 
 	marshaled := protocol.MarshalPacket(respPkt)
 
-	// Prepend WireID 0
-	innerBuf := make([]byte, 4+len(marshaled))
-	binary.BigEndian.PutUint32(innerBuf[0:4], 0)
-	copy(innerBuf[4:], marshaled)
+	// Prepend WireID 0 using 8 bytes (uint64)
+	innerBuf := make([]byte, 8+len(marshaled))
+	binary.BigEndian.PutUint64(innerBuf[0:8], 0)
+	copy(innerBuf[8:], marshaled)
 
-	// Wrap in OpRelay: [TargetID][InnerData]
-	relayBuf := make([]byte, bstd.SizeString(sourceID)+len(innerBuf))
-	n := bstd.MarshalString(0, relayBuf, sourceID)
+	// To Reply, we need the Initiator's WriteToken.
+	// We might have it if we queried them before.
+	writeToken, ok := p.GetWriteToken(sourceID)
+	if !ok {
+		// Limitation: In this basic PIR/Relay impl, if we don't have the token, we can't reply via relay.
+		// The initiator should ideally include their WriteToken in the encrypted payload, or we must query server.
+		p.Logger("[Relay] Cannot reply to handshake: missing Write Token for %s\n", sourceID)
+		return nil, nil
+	}
+
+	// Wrap in OpRelay: [WriteToken][InnerData]
+	relayBuf := make([]byte, bstd.SizeString(writeToken)+len(innerBuf))
+	n := bstd.MarshalString(0, relayBuf, writeToken)
 	copy(relayBuf[n:], innerBuf)
 
-	// Send OpRelay to Server
-	p.SendFast(context.Background(), remote.String(), protocol.OpRelay, relayBuf)
+	// Send OpRelay to Server (Push)
+	p.KeysMu.RLock()
+	serverAddr := p.RelayServerAddr
+	p.KeysMu.RUnlock()
+
+	if serverAddr == "" {
+		p.Logger("[Relay] Cannot reply to handshake: RelayServerAddr not set (StartPIR not running?)")
+		return nil, nil
+	}
+
+	// Fire-and-forget the response to the relay server
+	if err := p.SendFast(context.TODO(), serverAddr, protocol.OpRelay, relayBuf); err != nil {
+		p.Logger("[Relay] Failed to push handshake response: %v\n", err)
+	}
+
 	return nil, nil
 }
 
-// handleRelayedPacket unwraps a packet forwarded by the Rendezvous Server.
+// handleRelayedPacket unwraps a packet retrieved from the PIR bucket.
+// It determines if the packet belongs to this user by checking WireID or attempting Handshake decryption.
 func (p *Peer) handleRelayedPacket(remote *net.UDPAddr, data []byte) ([]byte, error) {
-	// Payload: [SourceID string][InnerData bytes]
-	n, sourceID, err := bstd.UnmarshalString(0, data)
-	if err != nil {
-		return nil, err
-	}
-	innerData := data[n:]
-
-	if len(innerData) < 4 {
+	// data is [WireID][Packet]
+	
+	if len(data) < 8 {
 		return nil, nil
 	}
 
-	// Peek WireID to determine if it's an encrypted session packet or a cleartext handshake
-	wireID := binary.BigEndian.Uint32(innerData[0:4])
+	wireID := binary.BigEndian.Uint64(data[0:8])
 
 	if wireID != 0 {
 		// Existing Encrypted Session
-		// We explicitly look up the session by SourceID because the physical 'remote' address
-		// is the Relay Server, not the peer.
-		sess, ok := p.GetSession(sourceID)
+		// We must look up the session by WireID.
+		sess, ok := p.GetSessionByWireID(wireID)
 		if !ok {
+			// WireID mismatch means this packet is for someone else in the bucket.
 			return nil, nil
 		}
-		// Inject into standard packet processing
-		p.transport.ProcessPacket(remote, sess, innerData)
+		
+		// Found session, process it.
+		// We pass 'sess' to bypass IP check in Transport.
+		// 'remote' is irrelevant for relayed packets.
+		p.transport.ProcessPacket(nil, sess, data)
 		return nil, nil
 	}
 
-	// Cleartext (Handshake/Punch)
-	pkt, err := protocol.UnmarshalPacket(innerData[4:])
+	// Cleartext (Handshake)
+	// Try to unmarshal.
+	pkt, err := protocol.UnmarshalPacket(data[8:])
 	if err != nil {
 		return nil, nil
 	}
 
 	if pkt.Op == protocol.OpHandshake {
-		// Handshake Response (Initiator Logic)
-		// If it's a reply to OUR handshake request, dispatch it to the waiting goroutine via 'pending'.
+		// Handshake Response
 		if pkt.IsReply {
-			p.dispatchPacket(remote, nil, 0, pkt)
+			p.dispatchPacket(nil, nil, 0, pkt)
 			return nil, nil
 		}
 
-		// Handshake Request (Responder Logic)
-		// Someone is trying to connect to us via the Relay.
-		// We handle this with a specialized handler that knows to reply via the Relay.
-		return p.handleIncomingRelayedHandshake(remote, sourceID, pkt)
+		// Handshake Request
+		return p.handleIncomingRelayedHandshake(remote, pkt)
 	}
 
 	return nil, nil

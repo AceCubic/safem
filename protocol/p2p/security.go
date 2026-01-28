@@ -20,6 +20,10 @@ import (
 // HandshakeWindow defines the time window in which a handshake attempt is valid.
 const HandshakeWindow = 30 * time.Second
 
+// MaxHandshakeCacheSize limits the number of tracked handshake signatures to prevent memory exhaustion.
+// 5000 entries is sufficient for high throughput while keeping memory footprint low (~0.5MB).
+const MaxHandshakeCacheSize = 5000
+
 // InviteData holds the credentials received during a friend invite.
 type InviteData struct {
 	Addr   string // Network Address
@@ -56,13 +60,13 @@ func deriveChainKeys(secret []byte, myID, peerID string) (rootKey, sendChainKey,
 
 // deriveWireID calculates the session identifier.
 // 0 is reserved for cleartext, so we ensure the result is never 0.
-func deriveWireID(secret []byte) (uint32, error) {
+func deriveWireID(secret []byte) (uint64, error) {
 	key, err := cryptolib.DeriveSessionKey(secret, []byte("Safem WireID"))
 	if err != nil {
 		return 0, err
 	}
 
-	val := binary.BigEndian.Uint32(key[:4])
+	val := binary.BigEndian.Uint64(key[:8])
 	if val == 0 {
 		return 1, nil
 	}
@@ -325,6 +329,8 @@ func (p *Peer) finishHandshake(id, addr string, respPayload []byte, ephemPriv *e
 	s.RelayAddr = relayAddr
 
 	s.Unlock()
+	// Update WireID Mapping
+	p.WireIDSessions.Store(wireID, s)
 
 	p.replayMu.Lock()
 	delete(p.replayStates, srvID)
@@ -358,78 +364,79 @@ func (p *Peer) handleHandshake(remote *net.UDPAddr, data []byte) ([]byte, error)
 		return append([]byte("CK"), p.generateCookie(remote.IP.String())...), nil
 	}
 
-	return p.processIncomingHandshake(remote.String(), ephemPubBytes, nonce, ciphertext, false, "")
+	out, _, err := p.processIncomingHandshake(remote.String(), ephemPubBytes, nonce, ciphertext, false, "")
+	return out, err
 }
 
-func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphertext []byte, relayed bool, relayAddr string) ([]byte, error) {
+func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphertext []byte, relayed bool, relayAddr string) ([]byte, string, error) {
 	// Establish Tunnel
 	curve := ecdh.X25519()
 	ephemPub, err := curve.NewPublicKey(ephemPubBytes)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	tunnelSecret, err := p.EncPrivKey.ECDH(ephemPub)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	tunnelKey, err := cryptolib.DeriveSessionKey(tunnelSecret, []byte("Safem Handshake Tunnel"))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	tunnelAEAD, err := cryptolib.NewAEAD(tunnelKey)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	decrypted, err := tunnelAEAD.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("tunnel decryption failed: %v", err)
+		return nil, "", fmt.Errorf("tunnel decryption failed: %v", err)
 	}
 
 	// Parse Identity & Key
 	buf := bytes.NewReader(decrypted)
 	var idLen uint16
 	if err := binary.Read(buf, binary.BigEndian, &idLen); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	idBytes := make([]byte, idLen)
 	if _, err := buf.Read(idBytes); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	senderID := string(idBytes)
 
 	var pubKeyLen uint16
 	if err := binary.Read(buf, binary.BigEndian, &pubKeyLen); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	providedPubKey := make([]byte, pubKeyLen)
 	if _, err := buf.Read(providedPubKey); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var ts uint64
 	if err := binary.Read(buf, binary.BigEndian, &ts); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var sigLen uint16
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	sig := make([]byte, sigLen)
 	if _, err := buf.Read(sig); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Check Timestamp
 	now := time.Now().Unix()
 	window := int64(HandshakeWindow.Seconds())
 	if now-int64(ts) > window || int64(ts)-now > window {
-		return nil, errors.New("handshake expired")
+		return nil, "", errors.New("handshake expired")
 	}
 
 	p.KeysMu.RLock()
@@ -441,16 +448,16 @@ func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphe
 			if cryptolib.Fingerprint(ed25519.PublicKey(providedPubKey)) == senderID {
 				senderSignPub = ed25519.PublicKey(providedPubKey)
 			} else {
-				return nil, fmt.Errorf("id mismatch for provided key")
+				return nil, "", fmt.Errorf("id mismatch for provided key")
 			}
 		} else {
-			return nil, fmt.Errorf("unknown peer: %s", senderID)
+			return nil, "", fmt.Errorf("unknown peer: %s", senderID)
 		}
 	}
 
 	verifyData := fmt.Appendf(nil, "%s%d%x", senderID, ts, ephemPubBytes)
 	if err := cryptolib.Verify(verifyData, sig, senderSignPub); err != nil {
-		return nil, fmt.Errorf("invalid signature: %v", err)
+		return nil, "", fmt.Errorf("invalid signature: %v", err)
 	}
 
 	// Check for Replay Cache
@@ -461,33 +468,44 @@ func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphe
 	if seen, exists := p.handshakeCache[sigHashStr]; exists {
 		if time.Since(seen) < HandshakeWindow {
 			p.handshakeCacheMu.Unlock()
-			return nil, fmt.Errorf("replay detected")
+			return nil, "", fmt.Errorf("replay detected")
 		}
 	}
+
+	// Enforce strict size limit on cache to prevent DoS (Memory Exhaustion)
+	if len(p.handshakeCache) >= MaxHandshakeCacheSize {
+		// Random eviction: since map iteration is random, deleting the first key
+		// found effectively removes a random entry.
+		for k := range p.handshakeCache {
+			delete(p.handshakeCache, k)
+			break
+		}
+	}
+
 	p.handshakeCache[sigHashStr] = time.Now()
 	p.handshakeCacheMu.Unlock()
 
 	// Generate Session Keys
 	respEphemPriv, respEphemPub, err := cryptolib.GenerateECDH()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	respEphemBytes := respEphemPub.Bytes()
 
 	sessionSecret, err := respEphemPriv.ECDH(ephemPub)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Key for encrypting the response
 	handshakeResKey, err := cryptolib.DeriveSessionKey(sessionSecret, []byte("Safem Handshake Resp"))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	handshakeAEAD, err := cryptolib.NewAEAD(handshakeResKey)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Construct Response
@@ -496,7 +514,7 @@ func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphe
 	respSigData := []byte(fmt.Sprintf("%s%d%x%x", myID, now, ephemPubBytes, respEphemBytes))
 	respSig, err := cryptolib.Sign(respSigData, p.PrivKey)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	respBuf := new(bytes.Buffer)
@@ -512,12 +530,12 @@ func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphe
 	// Install Session with Double Ratchet Init
 	rootKey, sendChainKey, recvChainKey, err := deriveChainKeys(sessionSecret, myID, senderID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	wireID, err := deriveWireID(sessionSecret)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	name := p.GetName(senderID)
@@ -553,6 +571,8 @@ func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphe
 	s.RelayAddr = relayAddr
 
 	s.Unlock()
+	// Sealed Sender: register WireID
+	p.WireIDSessions.Store(wireID, s)
 
 	p.replayMu.Lock()
 	delete(p.replayStates, senderID)
@@ -569,5 +589,5 @@ func (p *Peer) processIncomingHandshake(addr string, ephemPubBytes, nonce, ciphe
 	out = append(out, respNonce...)
 	out = append(out, respCipher...)
 
-	return out, nil
+	return out, senderID, nil
 }

@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -67,6 +68,12 @@ type Client struct {
 	Voice *VoiceManager
 
 	serverID           string
+
+	// Transparency Log / Split View Detection State
+	latestRoot     string
+	latestTreeSize int
+	latestRootTS   int64
+	rootMu         sync.RWMutex
 
 	// inviteLimiter restricts the rate of outbound friend invites to prevent spam.
 	inviteLimiter *rate.Limiter
@@ -144,7 +151,7 @@ func New(prof *profile.Profile, events Events) (*Client, error) {
 // Returns the local address string or an error.
 func (c *Client) Start() (string, error) {
 	// Initialize Voice asynchronously to avoid blocking the main thread (UI).
-	// Audio device initialization (PortAudio/Malgo) can be slow.
+	// Audio device initialization (Malgo) can be slow.
 	go c.Voice.Init()
 
 	addr, err := c.Peer.Start(0) // 0 lets the OS choose a port
@@ -155,6 +162,7 @@ func (c *Client) Start() (string, error) {
 	// Start background maintenance loops
 	go c.statusLoop()
 	go c.startHeartbeatLoop()
+	go c.startAuditLoop()
 
 	return addr, nil
 }
@@ -191,8 +199,9 @@ func (c *Client) ConnectToServer(ctx context.Context, addr, signPEM, encPEM stri
 	)
 
 	// Establish trust with the Server's identity
+	var serverPub ed25519.PublicKey
 	if signPEM != "" {
-		serverPub, _ := cryptolib.PEMToPubKey([]byte(signPEM))
+		serverPub, _ = cryptolib.PEMToPubKey([]byte(signPEM))
 		c.serverID = cryptolib.Fingerprint(serverPub)
 		c.Peer.TrustPeer(c.serverID, []byte(signPEM), []byte(encPEM))
 		c.Peer.MapPeer(addr, c.serverID, "Server")
@@ -204,10 +213,73 @@ func (c *Client) ConnectToServer(ctx context.Context, addr, signPEM, encPEM stri
 		return err
 	}
 
-	// Check response for server errors
+	// Check response for server errors and Verify Merkle Proof
 	respStrs := protocol.UnpackStrings(resp)
 	if len(respStrs) > 0 && strings.HasPrefix(respStrs[0], "ERROR") {
 		return fmt.Errorf("%s", respStrs[0])
+	}
+
+	// Expect: [OK, ServerPEM, Root, Proof, Index, Total, STH_Sig, TS, ReadToken]
+	if len(respStrs) >= 9 && respStrs[0] == "OK" {
+		rootHex := respStrs[2]
+		proofStr := respStrs[3]
+		idxStr := respStrs[4]
+		totalStr := respStrs[5]
+		sthSigHex := respStrs[6]
+		sthTs := respStrs[7]
+		readToken := respStrs[8] // Private Read Token for PIR
+
+		// 1. Verify STH Signature (Did OUR trusted server sign this root?)
+		if serverPub != nil {
+			sthSig, _ := hex.DecodeString(sthSigHex)
+			sthData := []byte(rootHex + sthTs)
+			if err := cryptolib.Verify(sthData, sthSig, serverPub); err != nil {
+				return fmt.Errorf("security: server STH signature failed")
+			}
+		}
+
+		// 2. Verify Inclusion Proof (Are WE in the tree?)
+		myID := c.Profile.GetID()
+		myLeafHash := cryptolib.CalculateLeafHash(myID, string(c.Profile.GetPublicKeyPEM()), string(c.Profile.GetEncPublicKeyPEM()))
+		
+		rootBytes, _ := hex.DecodeString(rootHex)
+		
+		var proof [][]byte
+		if proofStr != "" {
+			parts := strings.Split(proofStr, ",")
+			for _, p := range parts {
+				b, _ := hex.DecodeString(p)
+				proof = append(proof, b)
+			}
+		}
+
+		idx, _ := strconv.Atoi(idxStr)
+		total, _ := strconv.Atoi(totalStr)
+		tsVal, _ := strconv.ParseInt(sthTs, 10, 64)
+
+		if !cryptolib.VerifyMerkleProof(rootBytes, myLeafHash, proof, idx, total) {
+			return fmt.Errorf("security: merkle inclusion proof failed (server may be lying about our registration)")
+		}
+
+		c.Events.OnLog("[Security] Verified server transparency (Tree Size: %d)\n", total)
+
+		// 3. Store Validated Root for Split View Audit
+		c.rootMu.Lock()
+		c.latestRoot = rootHex
+		c.latestTreeSize = total
+		c.latestRootTS = tsVal
+		c.rootMu.Unlock()
+
+		// 4. Start PIR Poller (Receiver Side)
+		// We use our private Read Token to poll the bucket.
+		go c.Peer.StartPIR(context.Background(), addr, readToken)
+
+		// Broadcast this new state to friends immediately
+		c.BroadcastRootHash()
+
+	} else {
+		// Strict failure if no proof provided
+		return fmt.Errorf("security: server failed to provide transparency proof")
 	}
 
 	// Once connected, attempt to reconnect to known friends
@@ -223,6 +295,64 @@ func (c *Client) ConnectToServer(ctx context.Context, addr, signPEM, encPEM stri
 	}()
 
 	return nil
+}
+
+// BroadcastRootHash signs the currently known server root hash and sends it to all friends.
+// This allows peers to detect Split View attacks by comparing the root hashes they see.
+func (c *Client) BroadcastRootHash() {
+	c.rootMu.RLock()
+	root := c.latestRoot
+	size := c.latestTreeSize
+	ts := c.latestRootTS
+	c.rootMu.RUnlock()
+
+	if root == "" || size == 0 {
+		return
+	}
+
+	sizeStr := strconv.Itoa(size)
+	tsStr := strconv.FormatInt(ts, 10)
+
+	// Sign the observation: "I witnessed [Root] at size [Size] at time [TS]"
+	// Data: RootHex + Size + TS
+	dataToSign := []byte(root + sizeStr + tsStr)
+	sig, err := cryptolib.Sign(dataToSign, c.Peer.PrivKey)
+	if err != nil {
+		c.Events.OnLog("[Audit] Failed to sign root hash: %v\n", err)
+		return
+	}
+
+	// Payload: [RootHex, SizeStr, TSStr, Signature]
+	payload := protocol.PackStrings(root, sizeStr, tsStr, string(sig))
+
+	// Send to all online friends
+	friends := c.Profile.ListFriends()
+	count := 0
+	for _, f := range friends {
+		sess, ok := c.Peer.GetSession(f.ID)
+		if ok && sess.Addr != "" {
+			go func(addr string) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				c.Peer.SendFast(ctx, addr, protocol.OpRootBroadcast, payload)
+			}(sess.Addr)
+			count++
+		}
+	}
+	if count > 0 {
+		// c.Events.OnLog("[Audit] Broadcasted root hash to %d friends.\n", count)
+	}
+}
+
+// startAuditLoop periodically broadcasts the root hash to ensure consistency over time.
+func (c *Client) startAuditLoop() {
+	// Audit periodically (every 2 minutes)
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.BroadcastRootHash()
+	}
 }
 
 // Shutdown gracefully stops the client, disconnecting peers and cleaning up audio resources.

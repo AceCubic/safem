@@ -2,9 +2,12 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/banditmoscow1337/safem/protocol"
@@ -13,9 +16,7 @@ import (
 	"github.com/banditmoscow1337/safem/protocol/profile"
 )
 
-// SendInvite sends a friend request to a target ID via the Rendezvous Server.
-// It includes a cryptographic proof binding the keys to the specific target ID
-// to prevent MITM attacks by the server.
+// SendInvite sends an encrypted friend request to a target ID via the Rendezvous Server.
 func (c *Client) SendInvite(ctx context.Context, targetID string) {
 	go func() {
 		// Rate Limit: Block if we are sending too many invites too quickly
@@ -24,26 +25,75 @@ func (c *Client) SendInvite(ctx context.Context, targetID string) {
 			return
 		}
 
-		// Prepare Invite Proof: [TargetID, SignPEM, EncPEM, Timestamp]
-		signPEM := string(c.Profile.GetPublicKeyPEM())
-		encPEM := string(c.Profile.GetEncPublicKeyPEM())
+		// 1. LOOKUP PHASE: Get Target's Encryption Key from Server
+		c.Events.OnLog("[Invite] Resolving keys for %s...\n", targetID)
+
+		mySignPEM := string(c.Profile.GetPublicKeyPEM())
+		myEncPEM := string(c.Profile.GetEncPublicKeyPEM())
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 
-		dataToSign := fmt.Sprintf("%s%s%s%s", targetID, signPEM, encPEM, ts)
-		sig, err := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
+		// Sign the query to authenticate ourselves to the server
+		queryData := fmt.Sprintf("%s%s%s%s", targetID, mySignPEM, myEncPEM, ts)
+		querySig, _ := cryptolib.Sign([]byte(queryData), c.Peer.PrivKey)
+
+		queryPayload := protocol.PackStrings(targetID, mySignPEM, myEncPEM, ts, string(querySig))
+		queryResp, err := c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpQuery, queryPayload)
 		if err != nil {
-			c.Events.OnLog("Failed to sign invite: %v\n", err)
+			c.Events.OnLog("[Invite] Key lookup failed: %v\n", err)
 			return
 		}
 
-		// Payload: [TargetID, SignPEM, EncPEM, Timestamp, Signature]
-		payload := protocol.PackStrings(targetID, signPEM, encPEM, ts, string(sig))
+		qArgs := protocol.UnpackStrings(queryResp)
+		if len(qArgs) < 4 || qArgs[0] != "OK" {
+			c.Events.OnLog("[Invite] User not found or lookup failed.\n")
+			return
+		}
 
-		resp, err := c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpInvite, payload)
+		// Target Keys
+		targetEncPEM := qArgs[3]
+		targetEncPub, err := cryptolib.PEMToEncPubKey([]byte(targetEncPEM))
+		if err != nil {
+			c.Events.OnLog("[Invite] Invalid target encryption key.\n")
+			return
+		}
+
+		// Parse Write Token (Sealed Sender) if available
+		if len(qArgs) >= 11 {
+			writeToken := qArgs[10]
+			c.Peer.SetWriteToken(targetID, writeToken)
+		}
+
+		// 2. ENCRYPTION PHASE: Prepare Inner Payload (Identity Data)
+		myName := c.Profile.GetNickname()
+		myID := c.Profile.GetID()
+
+		innerDataToSign := fmt.Sprintf("%s%s%s%s%s", myID, myName, mySignPEM, myEncPEM, ts)
+		innerSig, _ := cryptolib.Sign([]byte(innerDataToSign), c.Peer.PrivKey)
+
+		innerPayload := protocol.PackStrings(myID, myName, mySignPEM, myEncPEM, ts, string(innerSig))
+
+		// Encrypt for Bob
+		encryptedBlob, err := cryptolib.EncryptHybrid(innerPayload, targetEncPub, []byte("INVITE"))
+		if err != nil {
+			c.Events.OnLog("[Invite] Encryption failed: %v\n", err)
+			return
+		}
+
+		blobHex := hex.EncodeToString(encryptedBlob)
+
+		// 3. ROUTING PHASE: Prepare Outer Payload for Server
+		outerDataToSign := fmt.Sprintf("%s%s%s", targetID, blobHex, ts)
+		outerSig, _ := cryptolib.Sign([]byte(outerDataToSign), c.Peer.PrivKey)
+
+		outerPayload := protocol.PackStrings(targetID, blobHex, ts, string(outerSig))
+
+		c.Events.OnLog("[Invite] Sending encrypted invite...\n")
+		resp, err := c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpInvite, outerPayload)
 		if err != nil {
 			c.Events.OnLog("Invite error: %v\n", err)
 			return
 		}
+
 		strs := protocol.UnpackStrings(resp)
 		if len(strs) > 0 {
 			c.Events.OnLog("[Server]: %s\n", strs[0])
@@ -51,8 +101,7 @@ func (c *Client) SendInvite(ctx context.Context, targetID string) {
 	}()
 }
 
-// AcceptInvite confirms a pending friend request.
-// It signs the acceptance to prove identity back to the inviter.
+// AcceptInvite confirms a pending friend request securely.
 func (c *Client) AcceptInvite(ctx context.Context, targetID string) {
 	c.Peer.KeysMu.RLock()
 	inv, ok := c.Peer.PendingInvites[targetID]
@@ -63,47 +112,68 @@ func (c *Client) AcceptInvite(ctx context.Context, targetID string) {
 		return
 	}
 
-	name := c.Peer.GetName(targetID)
-	// Process the friend acceptance logic (saving keys, updating profile)
-	c.AcceptFriendLogic(targetID, name, inv.Addr, inv.PEM, inv.EncPEM)
+	go func() {
+		// RESOLVE ADDRESS
+		realAddr := inv.Addr
+		if realAddr == "" {
+			var err error
+			lCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			realAddr, err = c.lookupPeerAddress(lCtx, targetID)
+			cancel()
+			if err != nil {
+				c.Events.OnLog("[Error] Could not resolve address for %s: %v. Cannot accept invite.\n", targetID, err)
+				return
+			}
+		}
 
-	// Prepare Acceptance Proof
-	signPEM := string(c.Profile.GetPublicKeyPEM())
-	encPEM := string(c.Profile.GetEncPublicKeyPEM())
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
+		name := c.Peer.GetName(targetID)
 
-	dataToSign := fmt.Sprintf("%s%s%s%s", targetID, signPEM, encPEM, ts)
-	sig, err := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
-	if err != nil {
-		c.Events.OnLog("Failed to sign acceptance: %v\n", err)
-		return
-	}
+		c.AcceptFriendLogic(targetID, name, realAddr, inv.PEM, inv.EncPEM)
 
-	// Payload: [TargetID, SignPEM, EncPEM, Timestamp, Signature]
-	payload := protocol.PackStrings(targetID, signPEM, encPEM, ts, string(sig))
+		// Encrypt Acceptance for Alice
+		targetEncPub, err := cryptolib.PEMToEncPubKey([]byte(inv.EncPEM))
+		if err != nil {
+			c.Events.OnLog("Cannot accept: invalid sender enc key\n")
+			return
+		}
 
-	// Notify Server that invite was accepted (so it can forward finalize msg)
-	go c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpAcceptInvite, payload)
+		myID := c.Profile.GetID()
+		myName := c.Profile.GetNickname()
+		mySignPEM := string(c.Profile.GetPublicKeyPEM())
+		myEncPEM := string(c.Profile.GetEncPublicKeyPEM())
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
 
-	// Clean up pending state
-	c.Peer.KeysMu.Lock()
-	delete(c.Peer.PendingInvites, targetID)
-	c.Peer.KeysMu.Unlock()
+		innerDataToSign := fmt.Sprintf("%s%s%s%s%s", myID, myName, mySignPEM, myEncPEM, ts)
+		innerSig, _ := cryptolib.Sign([]byte(innerDataToSign), c.Peer.PrivKey)
+
+		innerPayload := protocol.PackStrings(myID, myName, mySignPEM, myEncPEM, ts, string(innerSig))
+
+		encryptedBlob, _ := cryptolib.EncryptHybrid(innerPayload, targetEncPub, []byte("ACCEPT"))
+		blobHex := hex.EncodeToString(encryptedBlob)
+
+		outerDataToSign := fmt.Sprintf("%s%s%s", targetID, blobHex, ts)
+		outerSig, _ := cryptolib.Sign([]byte(outerDataToSign), c.Peer.PrivKey)
+
+		payload := protocol.PackStrings(targetID, blobHex, ts, string(outerSig))
+
+		c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpAcceptInvite, payload)
+
+		c.Peer.KeysMu.Lock()
+		delete(c.Peer.PendingInvites, targetID)
+		c.Peer.KeysMu.Unlock()
+	}()
 }
 
 // AcceptFriendLogic updates the local profile and P2P trust store with the new friend's details.
-// It also triggers the initial handshake process.
 func (c *Client) AcceptFriendLogic(id, name, addr, signPEM, encPEM string) {
 	c.Peer.TrustPeer(id, []byte(signPEM), []byte(encPEM))
 	c.Peer.MapPeer(addr, id, name)
-	c.Peer.HolePunch(addr) // Attempt NAT traversal
+	c.Peer.HolePunch(addr)
 
 	c.Profile.AddFriend(id, name, signPEM, encPEM)
 	c.Profile.Save()
 
 	go func() {
-		// Collision Avoidance: High ID waits, Low ID initiates handshake.
-		// This prevents both sides trying to handshake simultaneously.
 		myID := c.Profile.GetID()
 		delay := 200 * time.Millisecond
 		if myID > id {
@@ -111,10 +181,8 @@ func (c *Client) AcceptFriendLogic(id, name, addr, signPEM, encPEM string) {
 		}
 		time.Sleep(delay)
 
-		// Check if session is already healthy
 		if sess, ok := c.Peer.GetSession(id); ok {
 			if time.Since(sess.LastRx) < 10*time.Second {
-				// We are connected, so send our profile data immediately
 				c.sendMyContent(context.Background(), id)
 				return
 			}
@@ -126,7 +194,6 @@ func (c *Client) AcceptFriendLogic(id, name, addr, signPEM, encPEM string) {
 		if err := c.Peer.PerformHandshake(hsCtx, addr); err == nil {
 			c.Peer.StartSessionMonitor()
 			c.Events.OnFriendAdded(id, name)
-			// Connection established: Sync Profile
 			c.sendMyContent(context.Background(), id)
 		} else {
 			c.Events.OnLog("[System] Failed to handshake with new friend %s: %v\n", name, err)
@@ -134,21 +201,18 @@ func (c *Client) AcceptFriendLogic(id, name, addr, signPEM, encPEM string) {
 	}()
 }
 
-// RemoveFriend removes a friend from the local profile and terminates the connection.
 func (c *Client) RemoveFriend(id string) error {
 	c.Peer.Disconnect(id)
 	c.Profile.RemoveFriend(id)
-
 	return c.Profile.Save()
 }
 
-// GetSafetyNumber computes the safety number fingerprint for a specific friend.
 func (c *Client) GetSafetyNumber(friendID string) (string, error) {
 	friend, ok := c.Profile.GetFriend(friendID)
 	if !ok {
 		return "", fmt.Errorf("friend not found")
 	}
-	
+
 	friendKey, err := cryptolib.PEMToPubKey([]byte(friend.PEM))
 	if err != nil {
 		return "", fmt.Errorf("invalid friend key")
@@ -163,40 +227,120 @@ func (c *Client) GetSafetyNumber(friendID string) (string, error) {
 	return cryptolib.ComputeSafetyNumber(myKey, friendKey), nil
 }
 
+// lookupPeerAddress asks the server for the current address and Sealed Sender token of a peer ID.
+func (c *Client) lookupPeerAddress(ctx context.Context, targetID string) (string, error) {
+	signPEM := string(c.Profile.GetPublicKeyPEM())
+	encPEM := string(c.Profile.GetEncPublicKeyPEM())
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+
+	dataToSign := fmt.Sprintf("%s%s%s%s", targetID, signPEM, encPEM, ts)
+	sig, err := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
+	if err != nil {
+		return "", err
+	}
+
+	payload := protocol.PackStrings(targetID, signPEM, encPEM, ts, string(sig))
+
+	resp, err := c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpQuery, payload)
+	if err != nil {
+		return "", err
+	}
+
+	strs := protocol.UnpackStrings(resp)
+	if len(strs) < 2 || strs[0] != "OK" {
+		return "", fmt.Errorf("lookup failed or user not found")
+	}
+
+	// Save Write Token if present (Index 10)
+	if len(strs) >= 11 {
+		c.Peer.SetWriteToken(targetID, strs[10])
+	}
+
+	// [OK, Addr, SignPEM, EncPEM, Root, Proof, Index, Total, STH_Sig, TS, WriteToken]
+	return strs[1], nil
+}
+
 // reconnectFriends iterates through the saved friend list and attempts to restore connections.
 func (c *Client) reconnectFriends() {
 	friends := c.Profile.ListFriends()
+
+	_, serverSignPEM, _ := c.Profile.GetServer()
+	var serverPub ed25519.PublicKey
+	if serverSignPEM != "" {
+		serverPub, _ = cryptolib.PEMToPubKey([]byte(serverSignPEM))
+	}
+
 	for _, f := range friends {
 		go func(friend profile.Friend) {
 			c.Peer.TrustPeer(friend.ID, []byte(friend.PEM), []byte(friend.EncPEM))
 
-			// Lookup up-to-date address via Server using dedicated OpQuery
-			// This prevents triggering duplicate invite notifications on the target client.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			// Prepare Query Proof: [TargetID, SignPEM, EncPEM, Timestamp, Signature]
-			// The server requires authentication to release address info.
 			signPEM := string(c.Profile.GetPublicKeyPEM())
 			encPEM := string(c.Profile.GetEncPublicKeyPEM())
 			ts := strconv.FormatInt(time.Now().Unix(), 10)
-			
+
 			dataToSign := fmt.Sprintf("%s%s%s%s", friend.ID, signPEM, encPEM, ts)
 			sig, _ := cryptolib.Sign([]byte(dataToSign), c.Peer.PrivKey)
-			
+
 			payload := protocol.PackStrings(friend.ID, signPEM, encPEM, ts, string(sig))
 
 			resp, err := c.Peer.Call(ctx, c.Profile.GetServerAddr(), protocol.OpQuery, payload)
 			var targetAddr string
+
 			if err == nil {
 				strs := protocol.UnpackStrings(resp)
-				// Server Query Resp: [Status, TargetAddr, TargetSignPEM, TargetEncPEM]
-				if len(strs) >= 2 && strs[0] == "OK" {
+				// Server Query Resp: [Status, Addr, SignPEM, EncPEM, Root, Proof, Index, Total, STH_Sig, TS, WriteToken]
+
+				if len(strs) >= 10 && strs[0] == "OK" {
 					targetAddr = strs[1]
+					targetSign := strs[2]
+					targetEnc := strs[3]
+					rootHex := strs[4]
+					proofStr := strs[5]
+					idxStr := strs[6]
+					totalStr := strs[7]
+					sthSigHex := strs[8]
+					sthTs := strs[9]
+
+					// Save Write Token for Relay Authentication
+					if len(strs) >= 11 {
+						c.Peer.SetWriteToken(friend.ID, strs[10])
+					}
+
+					// --- cryptolib Verification ---
+					if serverPub != nil {
+						sthSig, _ := hex.DecodeString(sthSigHex)
+						sthData := []byte(rootHex + sthTs)
+						if err := cryptolib.Verify(sthData, sthSig, serverPub); err != nil {
+							c.Events.OnLog("[Security] STH Signature Failed for %s. Server may be compromised!\n", friend.Name)
+							return
+						}
+					}
+
+					leafHash := cryptolib.CalculateLeafHash(friend.ID, targetSign, targetEnc)
+					rootBytes, _ := hex.DecodeString(rootHex)
+
+					var proof [][]byte
+					if proofStr != "" {
+						parts := strings.Split(proofStr, ",")
+						for _, p := range parts {
+							b, _ := hex.DecodeString(p)
+							proof = append(proof, b)
+						}
+					}
+
+					idx, _ := strconv.Atoi(idxStr)
+					total, _ := strconv.Atoi(totalStr)
+
+					if !cryptolib.VerifyMerkleProof(rootBytes, leafHash, proof, idx, total) {
+						c.Events.OnLog("[Security] Key cryptolib Proof Failed for %s! Possible MITM.\n", friend.Name)
+						return
+					}
 				}
 			}
 
-			// Fallback to last known address if server lookup fails
 			if targetAddr == "" {
 				if existing, ok := c.Peer.GetSession(friend.ID); ok && existing.Addr != "" {
 					targetAddr = existing.Addr
@@ -205,7 +349,6 @@ func (c *Client) reconnectFriends() {
 				}
 			}
 
-			// Try Direct Connection (P2P)
 			c.Peer.MapPeer(targetAddr, friend.ID, friend.Name)
 			c.Peer.HolePunch(targetAddr)
 
@@ -214,15 +357,14 @@ func (c *Client) reconnectFriends() {
 			hsCancel()
 
 			if err != nil {
-				// FALLBACK TO RELAY
 				c.Events.OnLog("[Network] Direct connection to %s failed. Trying Relay...\n", friend.Name)
-				
+
 				serverAddr := c.Profile.GetServerAddr()
 				if serverAddr != "" {
 					relayCtx, relayCancel := context.WithTimeout(context.Background(), 5*time.Second)
 					relayErr := c.Peer.PerformRelayedHandshake(relayCtx, friend.ID, serverAddr)
 					relayCancel()
-					
+
 					if relayErr != nil {
 						c.Events.OnLog("[Network] Relay connection failed: %v\n", relayErr)
 						return
@@ -238,8 +380,6 @@ func (c *Client) reconnectFriends() {
 
 			c.Events.OnFriendStatus(friend.ID, true)
 			c.Peer.StartSessionMonitor()
-			
-			// Connection Established: Sync Profile
 			c.sendMyContent(context.Background(), friend.ID)
 
 		}(f)
@@ -248,58 +388,57 @@ func (c *Client) reconnectFriends() {
 
 // Handlers
 
-// handleIncomingInvite processes a forwarded invite from the server.
-// It verifies the cryptographic binding to ensure the invite was intended for us.
 func (c *Client) handleIncomingInvite(remote *net.UDPAddr, data []byte) ([]byte, error) {
 	args := protocol.UnpackStrings(data)
-	// Payload: [SenderName, SenderAddr, SignPEM, EncPEM, TargetID, Timestamp, Signature]
-	if len(args) < 7 {
+	if len(args) < 3 {
 		return nil, nil
 	}
+	senderID, blobHex, ts := args[0], args[1], args[2]
 
-	name, addr, signPEM, encPEM, targetID, ts, sigStr := args[0], args[1], args[2], args[3], args[4], args[5], args[6]
-	
-	// Verify Intent: Is this invite for ME?
-	if targetID != c.Profile.GetID() {
-		return nil, fmt.Errorf("security: invite target mismatch (got %s, expected %s)", targetID, c.Profile.GetID())
+	blob, err := hex.DecodeString(blobHex)
+	if err != nil {
+		return nil, fmt.Errorf("malformed hex")
 	}
 
-	// Verify Signature
+	encPriv, _ := cryptolib.ParseEncPrivateKey(string(c.Profile.GetEncPrivateKeyPEM()))
+	decryptedBytes, err := cryptolib.DecryptHybrid(blob, encPriv, []byte("INVITE"))
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %v", err)
+	}
+
+	innerArgs := protocol.UnpackStrings(decryptedBytes)
+	if len(innerArgs) < 6 {
+		return nil, fmt.Errorf("malformed inner payload")
+	}
+
+	incID, name, signPEM, encPEM, innerTS, sigStr := innerArgs[0], innerArgs[1], innerArgs[2], innerArgs[3], innerArgs[4], innerArgs[5]
+
+	if incID != senderID {
+		return nil, fmt.Errorf("security: sender ID mismatch in encrypted payload")
+	}
+
+	tsVal, _ := strconv.ParseInt(ts, 10, 64)
+	innerTSVal, _ := strconv.ParseInt(innerTS, 10, 64)
+	if time.Since(time.Unix(tsVal, 0)) > 10*time.Minute || time.Since(time.Unix(innerTSVal, 0)) > 10*time.Minute {
+		return nil, fmt.Errorf("security: invite expired")
+	}
+
 	pub, err := cryptolib.PEMToPubKey([]byte(signPEM))
 	if err != nil {
 		return nil, fmt.Errorf("invalid sender key")
 	}
 
-	dataToVerify := fmt.Sprintf("%s%s%s%s", targetID, signPEM, encPEM, ts)
+	dataToVerify := fmt.Sprintf("%s%s%s%s%s", incID, name, signPEM, encPEM, innerTS)
 	if err := cryptolib.Verify([]byte(dataToVerify), []byte(sigStr), pub); err != nil {
-		return nil, fmt.Errorf("security: invalid invite signature")
-	}
-
-	// Check Timestamp freshness (e.g., 5 min window)
-	tsVal, _ := strconv.ParseInt(ts, 10, 64)
-	if time.Since(time.Unix(tsVal, 0)) > 5*time.Minute {
-		return nil, fmt.Errorf("security: expired invite")
+		return nil, fmt.Errorf("security: invalid inner invite signature")
 	}
 
 	id := cryptolib.Fingerprint(pub)
 
-	// If we are already connected, ignore the invite trigger but update connection info
 	if _, ok := c.Profile.GetFriend(id); ok {
-		c.Peer.MapPeer(addr, id, name)
 		c.Peer.TrustPeer(id, []byte(signPEM), []byte(encPEM))
-		c.Peer.HolePunch(addr)
-
-		// Check active session health before triggering handshake
-		if sess, ok := c.Peer.GetSession(id); ok {
-			if time.Since(sess.LastRx) < 10*time.Second {
-				// We are healthy, so ensure we are synced
-				c.sendMyContent(context.Background(), id)
-				return protocol.PackStrings("ACK"), nil
-			}
-		}
 
 		go func() {
-			// Collision Avoidance logic
 			myID := c.Profile.GetID()
 			delay := 200 * time.Millisecond
 			if myID > id {
@@ -307,49 +446,69 @@ func (c *Client) handleIncomingInvite(remote *net.UDPAddr, data []byte) ([]byte,
 			}
 			time.Sleep(delay)
 
-			hsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			c.Peer.PerformHandshake(hsCtx, addr)
-			
-			// Connection Established: Sync
-			c.sendMyContent(context.Background(), id)
+
+			addr, err := c.lookupPeerAddress(ctx, id)
+			if err == nil {
+				c.Peer.MapPeer(addr, id, name)
+				c.Peer.HolePunch(addr)
+				c.Peer.PerformHandshake(ctx, addr)
+				c.sendMyContent(context.Background(), id)
+			}
 		}()
 
 		return protocol.PackStrings("ACK"), nil
 	}
 
-	// New Invite: Store pending state
 	c.Peer.KeysMu.Lock()
-	c.Peer.PendingInvites[id] = p2p.InviteData{Addr: addr, PEM: signPEM, EncPEM: encPEM}
+	c.Peer.PendingInvites[id] = p2p.InviteData{Addr: "", PEM: signPEM, EncPEM: encPEM}
 	c.Peer.KeysMu.Unlock()
-	c.Peer.MapPeer(addr, id, name)
+	c.Peer.MapPeer("", id, name)
 
-	c.Events.OnInviteReceived(id, name, addr, signPEM)
+	c.Events.OnInviteReceived(id, name, "via-server", signPEM)
 	return protocol.PackStrings("ACK"), nil
 }
 
-// handleInviteFinalized is called when the other user accepts OUR invite.
 func (c *Client) handleInviteFinalized(remote *net.UDPAddr, data []byte) ([]byte, error) {
 	args := protocol.UnpackStrings(data)
-	// Payload: [SenderName, SenderAddr, SignPEM, EncPEM, TargetID, Timestamp, Signature]
-	if len(args) < 7 {
+	if len(args) < 3 {
 		return nil, nil
 	}
+	senderID, blobHex, ts := args[0], args[1], args[2]
 
-	name, addr, signPEM, encPEM, targetID, ts, sigStr := args[0], args[1], args[2], args[3], args[4], args[5], args[6]
-
-	// Verify Intent
-	if targetID != c.Profile.GetID() {
-		return nil, fmt.Errorf("security: acceptance target mismatch")
+	blob, err := hex.DecodeString(blobHex)
+	if err != nil {
+		return nil, fmt.Errorf("malformed hex")
 	}
 
-	// Verify Signature
+	encPriv, _ := cryptolib.ParseEncPrivateKey(string(c.Profile.GetEncPrivateKeyPEM()))
+	decryptedBytes, err := cryptolib.DecryptHybrid(blob, encPriv, []byte("ACCEPT"))
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %v", err)
+	}
+
+	innerArgs := protocol.UnpackStrings(decryptedBytes)
+	if len(innerArgs) < 6 {
+		return nil, nil
+	}
+	incID, name, signPEM, encPEM, innerTS, sigStr := innerArgs[0], innerArgs[1], innerArgs[2], innerArgs[3], innerArgs[4], innerArgs[5]
+
+	if incID != senderID {
+		return nil, fmt.Errorf("security: sender ID mismatch")
+	}
+
+	tsVal, _ := strconv.ParseInt(ts, 10, 64)
+	if time.Since(time.Unix(tsVal, 0)) > 10*time.Minute {
+		return nil, fmt.Errorf("security: acceptance expired")
+	}
+
 	pub, err := cryptolib.PEMToPubKey([]byte(signPEM))
 	if err != nil {
 		return nil, fmt.Errorf("invalid sender key")
 	}
 
-	dataToVerify := fmt.Sprintf("%s%s%s%s", targetID, signPEM, encPEM, ts)
+	dataToVerify := fmt.Sprintf("%s%s%s%s%s", incID, name, signPEM, encPEM, innerTS)
 	if err := cryptolib.Verify([]byte(dataToVerify), []byte(sigStr), pub); err != nil {
 		return nil, fmt.Errorf("security: invalid acceptance signature")
 	}
@@ -362,7 +521,18 @@ func (c *Client) handleInviteFinalized(remote *net.UDPAddr, data []byte) ([]byte
 		}
 	}
 
-	// Finalize friend addition
-	c.AcceptFriendLogic(id, name, addr, signPEM, encPEM)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		addr, err := c.lookupPeerAddress(ctx, id)
+		if err != nil {
+			c.Events.OnLog("Failed to resolve address for new friend %s: %v", name, err)
+			return
+		}
+
+		c.AcceptFriendLogic(id, name, addr, signPEM, encPEM)
+	}()
+
 	return protocol.PackStrings("ACK"), nil
 }

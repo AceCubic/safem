@@ -36,7 +36,7 @@ sudo apt-get install -y libopus-dev libasound2-dev gcc pkg-config
 ### macOS
 
 ```bash
-brew install opus portaudio
+brew install opus
 
 ```
 
@@ -177,6 +177,6 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 
 This software is **experimental** and has not been audited by a third-party security firm. While it uses standard cryptographic primitives, **do not use this for life-critical situations** without your own verification.
 
-## 📄 License
+## License
 
 [MIT](LICENSE)

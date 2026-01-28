@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -54,7 +55,7 @@ type Session struct {
 
 	// WireID is a negotiated opaque identifier used in the packet header
 	// to identify the session without revealing the PeerID (Privacy).
-	WireID uint32
+	WireID uint64
 
 	// Ratchet Counters
 	TxCount uint64 // Next Sequence ID to send
@@ -110,9 +111,10 @@ func (s *Session) RotateRatchet() error {
 }
 
 // CheckAndMixRatchet atomically checks if the provided key is new and mixes it if so.
-// It holds the lock for the entire operation to prevent "Ratchet Race" conditions
-// where concurrent packets might trigger multiple mixes.
+// It holds the lock for the entire operation to prevent "Ratchet Race" conditions.
 // Returns true if a mix was performed.
+//
+// DEPRECATED: Use DecryptAndCommit to avoid state corruption on decryption failure.
 func (s *Session) CheckAndMixRatchet(newRemotePubBytes []byte) (bool, error) {
 	s.Lock()
 	defer s.Unlock()
@@ -171,13 +173,30 @@ func (p *Peer) GetSessionByAddr(addr string) (*Session, bool) {
 	return p.GetSession(id)
 }
 
+// GetSessionByWireID retrieves a session using the opaque WireID found in the packet header.
+// This is used for Sealed Sender (Relay) packets where the sender ID is not attached.
+func (p *Peer) GetSessionByWireID(wireID uint64) (*Session, bool) {
+	v, ok := p.WireIDSessions.Load(wireID)
+	if !ok {
+		return nil, false
+	}
+	return v.(*Session), true
+}
+
 // AddSession registers a session in the peer's state.
 func (p *Peer) AddSession(id string, s *Session) {
 	p.Sessions.Store(id, s)
+	if s.WireID != 0 {
+		p.WireIDSessions.Store(s.WireID, s)
+	}
 }
 
 // RemoveSession deletes a session from the peer's state.
 func (p *Peer) RemoveSession(id string) {
+	if v, ok := p.Sessions.Load(id); ok {
+		s := v.(*Session)
+		p.WireIDSessions.Delete(s.WireID)
+	}
 	p.Sessions.Delete(id)
 
 	// Clean up replay state to free memory and allow fresh reconnections
@@ -356,8 +375,154 @@ func (p *Peer) DisconnectAll() {
 	time.Sleep(100 * time.Millisecond)
 }
 
+
+// DecryptAndCommit attempts to decrypt the packet using a potential new state.
+// It calculates the hypothetical next Ratchet and Chain state, attempts decryption,
+// and ONLY updates the Session state if decryption succeeds.
+//
+// This prevents "Ratchet Flagging" attacks where malicious packets with bad signatures
+// force the session to advance its key state, desynchronizing it from the peer.
+func (s *Session) DecryptAndCommit(seqID uint64, newRemotePubBytes, ciphertext, nonce, aad, dst []byte) ([]byte, error) {
+	s.Lock()
+	defer s.Unlock()
+
+	// 1. Snapshot / Setup Candidate State
+	// We do not mutate s.RootKey or s.RecvChainKey until success.
+	candidateRoot := s.RootKey
+	candidateChain := s.RecvChainKey
+	candidateRxCount := s.RxCount
+
+	var nextRemotePub *ecdh.PublicKey
+	var ratchetChanged bool
+
+	// Handle DH Ratchet Step if provided in header
+	if len(newRemotePubBytes) == 32 {
+		// Only if it's actually new
+		if s.RemoteRatchetPub == nil || !bytes.Equal(newRemotePubBytes, s.RemoteRatchetPub.Bytes()) {
+			curve := ecdh.X25519()
+			pub, err := curve.NewPublicKey(newRemotePubBytes)
+			if err != nil {
+				return nil, err
+			}
+
+			// Calculate hypothetical DH secret
+			secret, err := s.RatchetPriv.ECDH(pub)
+			if err != nil {
+				return nil, err
+			}
+
+			// Derive hypothetical next Root & Chain Keys
+			rk, ck, err := cryptolib.KDF_RK(candidateRoot, secret)
+			if err != nil {
+				return nil, err
+			}
+
+			// This packet starts a new chain
+			ratchetChanged = true
+			candidateRoot = rk
+			candidateChain = ck
+			nextRemotePub = pub
+		}
+	}
+
+	// 2. Check Skipped Message Keys (Out of Order / Replay handling)
+	// If the message key is stored in SkippedMessageKeys, it belongs to a past state/chain.
+	// We use it directly and DO NOT advance the current ratchet/chain.
+	if key, ok := s.SkippedMessageKeys[seqID]; ok {
+		aead, err := cryptolib.NewAEAD(key)
+		if err != nil {
+			return nil, err
+		}
+		pt, err := aead.Open(dst, nonce, ciphertext, aad)
+		if err != nil {
+			return nil, err
+		}
+
+		// Success: Remove used key to prevent replay
+		delete(s.SkippedMessageKeys, seqID)
+		s.LastRx = time.Now()
+		return pt, nil
+	}
+
+	// 3. Verify Sequence Order
+	// If not in skipped keys and older than current count, it's a replay or too old.
+	if seqID < candidateRxCount {
+		return nil, fmt.Errorf("message too old or replay (seq %d < %d)", seqID, candidateRxCount)
+	}
+
+	// 4. Fast-Forward Symmetric Ratchet
+	// We need to advance the candidateChain until we reach the target sequence.
+	// We store the intermediate keys in 'skipped'.
+	var skipped = make(map[uint64][]byte)
+	var currChain = candidateChain
+	var msgKey []byte
+
+	// Limit catch-up to prevent CPU DOS
+	stepCount := seqID - candidateRxCount
+	if stepCount > MaxSkippedKeys {
+		return nil, fmt.Errorf("message too far ahead (gap %d)", stepCount)
+	}
+
+	for i := uint64(0); i < stepCount; i++ {
+		nextChain, mk, err := cryptolib.KDF_CK(currChain)
+		if err != nil {
+			return nil, err
+		}
+		skipped[candidateRxCount+i] = mk
+		currChain = nextChain
+	}
+
+	// One more step for the actual message
+	nextChain, mk, err := cryptolib.KDF_CK(currChain)
+	if err != nil {
+		return nil, err
+	}
+	currChain = nextChain
+	msgKey = mk
+
+	// 5. Attempt Decryption
+	aead, err := cryptolib.NewAEAD(msgKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt into dst (which may reuse ciphertext buffer)
+	pt, err := aead.Open(dst, nonce, ciphertext, aad)
+	if err != nil {
+		// Decryption FAILED. We return error and DO NOT update session state.
+		return nil, fmt.Errorf("decryption failed: %v", err)
+	}
+
+	// 6. Success - Commit State
+	s.RecvChainKey = currChain
+	s.RxCount = seqID + 1
+	s.LastRx = time.Now()
+
+	if ratchetChanged {
+		s.RootKey = candidateRoot
+		s.RemoteRatchetPub = nextRemotePub
+	}
+
+	// Merge skipped keys
+	for k, v := range skipped {
+		// Enforce max skipped keys limit (Eviction)
+		if len(s.SkippedMessageKeys) >= MaxSkippedKeys {
+			var minSeq uint64 = math.MaxUint64
+			for existingK := range s.SkippedMessageKeys {
+				if existingK < minSeq {
+					minSeq = existingK
+				}
+			}
+			delete(s.SkippedMessageKeys, minSeq)
+		}
+		s.SkippedMessageKeys[k] = v
+	}
+
+	return pt, nil
+}
+
 // GetDecryptionKey locates the correct message key for a given sequence number.
-// It handles out-of-order delivery by advancing the chain and buffering skipped keys.
+// DEPRECATED: Use DecryptAndCommit instead.
 func (s *Session) GetDecryptionKey(seq uint64) ([]byte, cipher.AEAD, error) {
 	// Check Skipped Keys (Out-of-Order arrival from the past)
 	if key, ok := s.SkippedMessageKeys[seq]; ok {
@@ -397,6 +562,18 @@ func (s *Session) GetDecryptionKey(seq uint64) ([]byte, cipher.AEAD, error) {
 			if err != nil {
 				return nil, nil, err
 			}
+
+			// Garbage Collection: Limit the number of stored skipped keys (FIFO)
+			if len(s.SkippedMessageKeys) >= MaxSkippedKeys {
+				var minSeq uint64 = math.MaxUint64
+				for k := range s.SkippedMessageKeys {
+					if k < minSeq {
+						minSeq = k
+					}
+				}
+				delete(s.SkippedMessageKeys, minSeq)
+			}
+
 			s.SkippedMessageKeys[s.RxCount] = skippedMsgKey
 			s.RecvChainKey = newChainKey
 			s.RxCount++
